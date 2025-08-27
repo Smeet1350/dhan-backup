@@ -97,12 +97,12 @@ export default function App() {
           setHoldings(Array.isArray(data) ? data : []);
         } else {
           setHoldings([]);
-          setError(h.data?.message ?? "Failed to load holdings");
+          setError(h.data?.message ?? "Dhan API failure");
         }
-      } catch (e) {
-        setHoldings([]);
-        setError("Error fetching holdings: " + safeMsg(e.message || e));
-      }
+              } catch (e) {
+          setHoldings([]);
+          setError("Backend unreachable");
+        }
 
       // 4) positions
       try {
@@ -112,12 +112,12 @@ export default function App() {
           setPositions(Array.isArray(data) ? data : []);
         } else {
           setPositions([]);
-          setError(p.data?.message ?? "Failed to load positions");
+          setError(p.data?.message ?? "Dhan API failure");
         }
-      } catch (e) {
-        setPositions([]);
-        setError("Error fetching positions: " + safeMsg(e.message || e));
-      }
+              } catch (e) {
+          setPositions([]);
+          setError("Backend unreachable");
+        }
     } catch (err) {
       // Overall failure (backend unreachable or CORS)
       setStatus("Not Connected ❌");
