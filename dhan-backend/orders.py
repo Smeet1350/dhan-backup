@@ -1,87 +1,145 @@
+# orders.py
+import os
+import sqlite3
+import logging
+from typing import Dict, Any, Optional
+
 from dhanhq import dhanhq
-import sqlite3, os
-from scheduler import DB_FILE
 
-# 🔑 Add your real credentials here
-DHAN_CLIENT_ID = "YOUR_CLIENT_ID"
-DHAN_ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+logger = logging.getLogger("orders")
+logger.setLevel(logging.INFO)
 
-dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+# Credentials - hardcoded (⚠️ insecure, but what you asked for)
+DHAN_CLIENT_ID = "1107860004"       # replace with your client id
+DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU2ODM2NDA4LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNzg2MDAwNCJ9.3cuzgiY0Qm2Id8wpMW0m90_ZxJ0TJRTV5fZ0tpAwWo3S1Mv5HbpcDNwXxXVepnOUHMRDck_AbArIoVOmlA68Dg"  # replace with your access token
 
-def resolve_symbol(symbol: str, segment_filter: str = None):
-    """Lookup symbol in SQLite (downloaded daily)"""
-    if not os.path.exists(DB_FILE):
-        return {"status": "error", "message": "Instrument master not available."}
+# instantiate Dhan client
+try:
+    dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+    logger.info("Dhan client initialized")
+except Exception as e:
+    dhan = None
+    logger.exception("Failed to init Dhan client: %s", e)
 
-    conn = sqlite3.connect(DB_FILE)
+INSTRUMENT_DB_FILE = os.getenv("INSTRUMENT_DB_FILE", "instruments.db")
+
+def resolve_symbol(symbol: str, segment_filter: Optional[str] = None) -> Dict[str, Any]:
+    """Return list of possible instrument matches for symbol from DB."""
+    symbol_up = symbol.strip().upper()
+    if not os.path.exists(INSTRUMENT_DB_FILE):
+        return {"status": "error", "message": "instrument master not available"}
+    conn = sqlite3.connect(INSTRUMENT_DB_FILE)
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-
+    params = (symbol_up,)
     if segment_filter:
         cur.execute("""
-            SELECT securityId, tradingSymbol, exchangeSegment, instrument, expiry, lotSize, underlying
-            FROM instruments
-            WHERE tradingSymbol = ? AND exchangeSegment = ?
-        """, (symbol.upper(), segment_filter))
+            SELECT securityId, raw FROM instruments WHERE UPPER(tradingSymbol)=? AND UPPER(segment)=?
+        """, (symbol_up, segment_filter.upper()))
     else:
-        cur.execute("""
-            SELECT securityId, tradingSymbol, exchangeSegment, instrument, expiry, lotSize, underlying
-            FROM instruments
-            WHERE tradingSymbol = ?
-        """, (symbol.upper(),))
-
+        cur.execute("SELECT securityId, raw FROM instruments WHERE UPPER(tradingSymbol)=?", params)
     rows = cur.fetchall()
     conn.close()
-
     if not rows:
-        return {"status": "error", "message": f"Symbol {symbol.upper()} not found"}
-
+        return {"status": "error", "message": f"symbol {symbol_up} not found"}
     results = []
-    for row in rows:
+    for r in rows:
+        try:
+            raw = r["raw"]
+            if isinstance(raw, str):
+                import json
+                raw = json.loads(raw)
+        except Exception:
+            raw = {}
         results.append({
-            "securityId": row[0],
-            "tradingSymbol": row[1],
-            "exchangeSegment": row[2],
-            "instrument": row[3],
-            "expiry": row[4],
-            "lotSize": row[5],
-            "underlying": row[6]
+            "securityId": r["securityId"],
+            "tradingSymbol": raw.get("tradingSymbol"),
+            "exchange": raw.get("exchange"),
+            "segment": raw.get("segment"),
+            "expiry": raw.get("expiry"),
+            "lotSize": raw.get("lotSize"),
+            "raw": raw
         })
+    return {"status": "success", "results": results}
 
-    return {"status": "success", "data": results}
+def place_order_via_dhan(security_id: str, exchange_segment: str, transaction_type: str, quantity: int,
+                         order_type: str = "MARKET", price: float = 0.0, product_type: str = "DELIVERY",
+                         validity: str = "DAY", disclosed_qty: int = 0) -> Dict[str, Any]:
+    """Place order using dhanhq client. Returns dhanhq response dict or error dict."""
+    if dhan is None:
+        return {"status": "error", "message": "Dhan client not initialized"}
 
-
-def place_order(symbol: str, qty: int, side: str = "BUY", segment: str = "EQUITY"):
-    """
-    Place order in equity/F&O/other segment.
-    side: BUY / SELL
-    segment: EQUITY, FNO, FUT, etc.
-    """
-    # Step 1: Resolve symbol
-    res = resolve_symbol(symbol, segment_filter=None)
-    if res["status"] != "success":
-        return res
-
-    # Just pick the first match for now (later we can refine)
-    instrument = res["data"][0]
-
-    # Step 2: Place order
     try:
+        # Map simple field names to dhanhq parameters; adjust if SDK expects different keys
         order = dhan.place_order(
-            tag="my_dhan_order",
-            transaction_type=side,
-            exchange_segment=instrument["exchangeSegment"],
-            product="CNC",  # CNC for equity delivery, change for intraday/F&O
-            order_type="MARKET",
-            validity="DAY",
-            security_id=instrument["securityId"],
-            quantity=qty,
-            disclosed_quantity=0,
-            price=0,
-            trigger_price=0,
-            after_market_order=False,
-            amo_time="OPEN"
+            security_id=str(security_id),
+            exchange_segment=exchange_segment,
+            transaction_type=transaction_type,
+            quantity=int(quantity),
+            price=float(price),
+            order_type=order_type,
+            product_type=product_type,
+            validity=validity,
+            disclosed_quantity=int(disclosed_qty)
         )
-        return {"status": "success", "symbol": symbol, "qty": qty, "side": side, "details": order}
-
+        logger.info("Dhan place_order response: %s", order)
+        return order
     except Exception as e:
+        logger.exception("Exception placing order: %s", e)
+        return {"status": "error", "message": str(e)}
+
+def get_order_list() -> Dict[str, Any]:
+    if dhan is None:
+        return {"status": "error", "message": "Dhan client not initialized"}
+    try:
+        res = dhan.get_order_list()
+        logger.info("Dhan get_order_list response: %s", res)
+        return res
+    except Exception as e:
+        logger.exception("Exception fetching orders: %s", e)
+        return {"status": "error", "message": str(e)}
+
+def cancel_order(order_id: str) -> Dict[str, Any]:
+    if dhan is None:
+        return {"status": "error", "message": "Dhan client not initialized"}
+    try:
+        res = dhan.cancel_order(order_id)
+        logger.info("Dhan cancel_order response: %s", res)
+        return res
+    except Exception as e:
+        logger.exception("Exception cancelling order: %s", e)
+        return {"status": "error", "message": str(e)}
+
+# helper for balance/holdings/positions
+def get_funds() -> Dict[str, Any]:
+    if dhan is None:
+        return {"status": "error", "message": "Dhan client not initialized"}
+    try:
+        res = dhan.get_fund_limits()
+        logger.info("Dhan funds response: %s", res)
+        return res
+    except Exception as e:
+        logger.exception("Exception fetching funds: %s", e)
+        return {"status": "error", "message": str(e)}
+
+def get_holdings() -> Dict[str, Any]:
+    if dhan is None:
+        return {"status": "error", "message": "Dhan client not initialized"}
+    try:
+        res = dhan.get_holdings()
+        logger.info("Dhan holdings response: %s", res)
+        return res
+    except Exception as e:
+        logger.exception("Exception fetching holdings: %s", e)
+        return {"status": "error", "message": str(e)}
+
+def get_positions() -> Dict[str, Any]:
+    if dhan is None:
+        return {"status": "error", "message": "Dhan client not initialized"}
+    try:
+        res = dhan.get_positions()
+        logger.info("Dhan positions response: %s", res)
+        return res
+    except Exception as e:
+        logger.exception("Exception fetching positions: %s", e)
         return {"status": "error", "message": str(e)}
