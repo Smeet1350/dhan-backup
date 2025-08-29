@@ -3,6 +3,9 @@ uvicorn[standard]==0.35.0
 dhanhq==2.0.2
 python-multipart==0.0.20
 apscheduler==3.10.1
-requests==2.31.0
-pytz==2024.1
-python-dotenv==1.0.0
+requests==2.32.5
+pytz==2025.2
+python-dotenv==1.1.1
+pandas==2.3.2
+numpy==2.3.2
+python-dateutil==2.9.0.post0

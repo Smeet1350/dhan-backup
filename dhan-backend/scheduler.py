@@ -1,345 +1,217 @@
 # scheduler.py
-import os
+from __future__ import annotations
+
 import io
-import csv
-import json
-import tempfile
-import sqlite3
 import logging
-import time as time_module
-from datetime import date
-from typing import Optional, List, Dict
+import os
+import sqlite3
+from datetime import datetime
+from typing import Dict, List, Optional
 
+import pandas as pd
 import requests
-import pytz
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 
-logger = logging.getLogger("instruments")
-logger.setLevel(logging.INFO)
+LOG = logging.getLogger("scheduler")
 
-# CONFIG
-INSTRUMENT_DB_FILE = os.getenv("INSTRUMENT_DB_FILE", "instruments.db")
-INSTRUMENT_SOURCE_URL = os.getenv(
-    "INSTRUMENT_MASTER_SOURCE",
-    "https://images.dhan.co/api-data/api-scrip-master.csv"
+# Defaults (can be overridden by env)
+DEFAULT_DB = os.getenv("INSTRUMENTS_DB", "instruments.db")
+MASTER_URL = os.getenv(
+    "DHAN_MASTER_URL",
+    "https://images.dhan.co/api-data/api-scrip-master.csv",
 )
-DAILY_DOWNLOAD_HOUR = int(os.getenv("DAILY_DOWNLOAD_HOUR", "8"))
-DAILY_DOWNLOAD_MINUTE = int(os.getenv("DAILY_DOWNLOAD_MINUTE", "0"))
-DAILY_CLEANUP_HOUR = int(os.getenv("DAILY_CLEANUP_HOUR", "16"))
-DAILY_CLEANUP_MINUTE = int(os.getenv("DAILY_CLEANUP_MINUTE", "0"))
-DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))
-DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "30"))
-IST = pytz.timezone("Asia/Kolkata")
 
-# in-memory indexes
-instruments_by_symbol = {}   # symbol upper -> list of inst dicts
-instruments_by_id = {}       # securityId -> inst dict
-last_updated: Optional[str] = None
-_index_lock = None
+# ------------- SQLite helpers -------------
+def _connect(db_path: str) -> sqlite3.Connection:
+    return sqlite3.connect(db_path, timeout=30, isolation_level=None)
 
-def _create_db(conn: sqlite3.Connection):
+def _ensure_indexes(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS instruments")
-    cur.execute("""
-    CREATE TABLE instruments (
-        securityId TEXT PRIMARY KEY,
-        tradingSymbol TEXT,
-        exchange TEXT,
-        segment TEXT,
-        expiry TEXT,
-        lotSize INTEGER,
-        raw TEXT,
-        last_updated DATE
-    )""")
-    cur.execute("DROP TABLE IF EXISTS meta")
-    cur.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    # Create table if missing (we'll replace with the CSV later)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS instruments (
+            securityId TEXT,
+            tradingSymbol TEXT,
+            segment TEXT,
+            lotSize INTEGER,
+            expiry TEXT
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_tradingsymbol ON instruments(tradingSymbol)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_segment ON instruments(segment)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_securityid ON instruments(securityId)")
     conn.commit()
 
-def _insert_row(conn: sqlite3.Connection, inst: Dict):
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO instruments
-        (securityId, tradingSymbol, exchange, segment, expiry, lotSize, raw, last_updated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        inst.get("securityId"),
-        inst.get("tradingSymbol"),
-        inst.get("exchange"),
-        inst.get("segment"),
-        inst.get("expiry"),
-        inst.get("lotSize") or 1,
-        json.dumps(inst.get("raw_row", inst)),
-        inst.get("last_updated"),
-    ))
-    conn.commit()
-
-def _normalize_row(row: Dict[str,str]) -> Optional[Dict]:
-    # Normalize column names (robust to variations)
-    def g(*names):
-        for n in names:
-            if n in row and row[n] is not None:
-                return str(row[n]).strip()
-            # try lowercase key
-            ln = n.lower()
-            for k in row:
-                if k.lower() == ln:
-                    return str(row[k]).strip()
-        return None
-
-    securityId = g("securityId", "security_id", "id", "instrumenttoken", "token")
-    tradingSymbol = g("tradingSymbol", "trading_symbol", "symbol", "tradingsymbol")
-    exchange = g("exchange", "exch", "exchange_segment")
-    segment = g("segment", "instrument")
-    expiry = g("expiry", "expiry_date", "expirydate")
-    lot = g("lotSize", "lot_size", "lotsize", "lot")
-    if not securityId or not tradingSymbol:
-        return None
+# ------------- Instrument master ops -------------
+def download_and_populate(db_path: Optional[str] = None) -> Dict[str, str | int]:
+    """Download the Dhan scrip master CSV and (re)build the instruments table."""
+    db_path = db_path or DEFAULT_DB
+    LOG.info("⏬ Downloading scrip master from %s", MASTER_URL)
     try:
-        lotVal = int(float(lot)) if lot else 1
-    except Exception:
-        lotVal = 1
-    inst = {
-        "securityId": str(securityId),
-        "tradingSymbol": tradingSymbol,
-        "exchange": exchange or "",
-        "segment": segment or "",
-        "expiry": expiry or "",
-        "lotSize": lotVal,
-        "raw_row": row
-    }
-    return inst
+        # Download + validate size & rows
+        url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
 
-def _download_text() -> str:
-    last_exc = None
-    for attempt in range(1, DOWNLOAD_RETRIES+1):
-        try:
-            logger.info("Downloading instruments from %s (attempt %d)", INSTRUMENT_SOURCE_URL, attempt)
-            r = requests.get(INSTRUMENT_SOURCE_URL, timeout=DOWNLOAD_TIMEOUT)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_exc = e
-            backoff = 1 << attempt
-            logger.warning("Download attempt %d failed: %s — retrying in %ds", attempt, e, backoff)
-            time_module.sleep(backoff)
-    logger.error("All download attempts failed: %s", last_exc)
-    raise last_exc
+        raw = r.content                       # bytes
+        dl_bytes = len(raw)
+        if dl_bytes < 10 * 1024 * 1024:       # 10 MB sanity threshold
+            raise RuntimeError(f"CSV too small: {dl_bytes} bytes — aborting to avoid corrupt DB")
 
-def download_and_populate() -> Dict:
-    """Download master and write an atomic sqlite DB file. Returns status dict."""
-    global last_updated, instruments_by_symbol, instruments_by_id
-    txt = _download_text()
-    today = date.today().isoformat()
+        df = pd.read_csv(io.BytesIO(raw))
+        if len(df) < 50000:                   # Dhan master usually has many more rows
+            raise RuntimeError(f"Too few rows: {len(df)} — aborting to avoid corrupt DB")
 
-    # write to temp DB
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db")
-    os.close(tmp_fd)
-    try:
+        # Normalize column names (case-insensitive match)
+        cols = {c.lower(): c for c in df.columns}
+        def pick(name: str) -> str:
+            # return the real column name in df for a lowercase key
+            return cols.get(name.lower(), name)
+
+        # Build a minimal, stable schema the app needs
+        needed = {
+            "securityId": pick("securityId"),
+            "tradingSymbol": pick("tradingSymbol"),
+            "segment": pick("segment"),
+            "lotSize": pick("lotSize"),
+            "expiry": pick("expiry"),
+        }
+
+        for want, real in list(needed.items()):
+            if real not in df.columns:
+                # If missing, create empty column
+                df[want] = None
+                needed[want] = want
+
+        df_norm = df[[needed["securityId"], needed["tradingSymbol"], needed["segment"], needed["lotSize"], needed["expiry"]]].copy()
+        df_norm.columns = ["securityId", "tradingSymbol", "segment", "lotSize", "expiry"]
+
+        # Write atomically using a temp DB (so you never end up with 20 KB half-writes)
+        tmp_path = db_path + ".tmp"
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
         conn = sqlite3.connect(tmp_path)
-        _create_db(conn)
-        # detect CSV vs JSON
-        s = txt.lstrip()
-        if s.startswith("{") or s.startswith("["):
-            parsed = json.loads(txt)
-            rows = parsed if isinstance(parsed, list) else (parsed.get("data") or parsed.get("instruments") or [])
-            for r in rows:
-                if not isinstance(r, dict): continue
-                inst = _normalize_row({k: ("" if r[k] is None else str(r[k])) for k in r})
-                if inst:
-                    inst["last_updated"] = today
-                    _insert_row(conn, inst)
-        else:
-            csvfile = io.StringIO(txt)
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                inst = _normalize_row(row)
-                if inst:
-                    inst["last_updated"] = today
-                    _insert_row(conn, inst)
-
-        # save meta
         cur = conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", ("date", today))
+
+        # keep your current CREATE TABLE/INDEX logic here, then:
+        df_norm.to_sql("instruments", conn, if_exists="replace", index=False)
+
+        # indexes (keep yours; add if missing)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tradingsymbol ON instruments(tradingSymbol)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_securityid ON instruments(securityId)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_segment ON instruments(segment)")
+
+        # optional: Light vacuum to compact temp DB before swap
+        cur.execute("VACUUM")
         conn.commit()
         conn.close()
 
-        # atomically replace DB file
-        os.replace(tmp_path, INSTRUMENT_DB_FILE)
-        logger.info("Instruments DB saved to %s", INSTRUMENT_DB_FILE)
+        # Atomic replace so readers never see a broken DB
+        os.replace(tmp_path, db_path)
 
-        # load into memory
-        load_index_from_db()
-        return {"status": "success", "date": today}
+        LOG.info("✅ instruments saved to %s (rows=%d)", db_path, len(df_norm))
+        return {"status": "success", "rows": int(len(df_norm))}
     except Exception as e:
-        logger.exception("Failed to write instruments DB: %s", e)
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        raise
+        LOG.exception("❌ download_and_populate failed")
+        return {"status": "error", "message": str(e)}
 
-def load_index_from_db() -> bool:
-    """Load instruments into memory. Returns True on success."""
-    global instruments_by_symbol, instruments_by_id, last_updated
-    if not os.path.exists(INSTRUMENT_DB_FILE):
-        logger.warning("DB file not present: %s", INSTRUMENT_DB_FILE)
-        return False
-    conn = sqlite3.connect(INSTRUMENT_DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM meta WHERE key = ?", ("date",))
-    row = cur.fetchone()
-    last_updated = row[0] if row else None
+def cleanup_instruments(db_path: Optional[str] = None) -> Dict[str, str]:
+    """Delete the instruments DB if present."""
+    db_path = db_path or DEFAULT_DB
+    try:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+            LOG.info("🗑 Deleted %s", db_path)
+            return {"message": "DB removed"}
+        LOG.info("ℹ️ %s not present; nothing to delete", db_path)
+        return {"message": "DB not present"}
+    except Exception as e:
+        LOG.exception("❌ cleanup_instruments failed")
+        return {"message": f"cleanup failed: {e}"}
 
-    tmp_by_symbol = {}
-    tmp_by_id = {}
-    cur.execute("SELECT securityId, raw FROM instruments")
-    rows = cur.fetchall()
-    for r in rows:
-        sid = r["securityId"]
-        try:
-            raw = json.loads(r["raw"])
-        except Exception:
-            try:
-                raw = json.loads(r["raw"].replace("'", "\""))
-            except Exception:
-                raw = {}
-        sym = str(raw.get("tradingSymbol","")).upper()
-        inst = {
-            "securityId": sid,
-            "tradingSymbol": raw.get("tradingSymbol"),
-            "exchange": raw.get("exchange"),
-            "segment": raw.get("segment"),
-            "expiry": raw.get("expiry"),
-            "lotSize": raw.get("lotSize"),
-            "raw": raw
-        }
-        tmp_by_id[sid] = inst
-        if sym:
-            tmp_by_symbol.setdefault(sym, []).append(inst)
-    conn.close()
-
-    instruments_by_symbol = tmp_by_symbol
-    instruments_by_id = tmp_by_id
-    logger.info("Loaded %d instruments into memory (date=%s)", len(instruments_by_id), last_updated)
-    return True
-
-def db_is_current() -> bool:
-    if not os.path.exists(INSTRUMENT_DB_FILE):
+def db_is_current(db_path: Optional[str] = None) -> bool:
+    """True if instruments DB exists and was modified *today* (local date)."""
+    db_path = db_path or DEFAULT_DB
+    if not os.path.exists(db_path):
         return False
     try:
-        conn = sqlite3.connect(INSTRUMENT_DB_FILE)
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM meta WHERE key = ?", ("date",))
-        row = cur.fetchone()
-        conn.close()
-        return bool(row and row[0] == date.today().isoformat())
+        mtime = datetime.fromtimestamp(os.path.getmtime(db_path))
+        return mtime.date() == datetime.now().date()
     except Exception:
         return False
 
-def search_instruments(query: str, segment: Optional[str]=None, limit: int=20) -> List[Dict]:
-    q = query.strip().upper()
-    if not q:
+# ------------- Query helpers -------------
+def symbol_search(db_path: Optional[str], query: str, segment: str, limit: int = 30) -> List[Dict[str, str | int]]:
+    """LIKE search by tradingSymbol + exact segment."""
+    db_path = db_path or DEFAULT_DB
+    if not query or not segment:
         return []
-    results = []
-    # in-memory search first
-    for sym, items in instruments_by_symbol.items():
-        if q in sym:
-            for inst in items:
-                if segment and segment.upper() not in (inst.get("segment") or "").upper():
-                    continue
-                results.append(inst)
-                if len(results) >= limit:
-                    return results
-    # fallback to sqlite
-    if os.path.exists(INSTRUMENT_DB_FILE):
-        try:
-            conn = sqlite3.connect(INSTRUMENT_DB_FILE)
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            pattern = f"%{q}%"
-            cur.execute("""
-                SELECT securityId, raw FROM instruments
-                WHERE UPPER(tradingSymbol) LIKE ? OR UPPER(securityId) LIKE ?
-                LIMIT ?
-            """, (pattern, pattern, limit))
-            for r in cur.fetchall():
-                inst = json.loads(r["raw"])
-                candidate = {
-                    "securityId": r["securityId"],
-                    "tradingSymbol": inst.get("tradingSymbol"),
-                    "exchange": inst.get("exchange"),
-                    "segment": inst.get("segment"),
-                    "expiry": inst.get("expiry"),
-                    "lotSize": inst.get("lotSize"),
-                    "raw": inst
-                }
-                if candidate not in results:
-                    results.append(candidate)
-                    if len(results) >= limit:
-                        break
-            conn.close()
-        except Exception:
-            logger.exception("SQLite fallback search failed")
-    return results[:limit]
+    if not os.path.exists(db_path):
+        return []
 
-def cleanup_instruments() -> Dict:
-    global instruments_by_symbol, instruments_by_id, last_updated
-    instruments_by_symbol = {}
-    instruments_by_id = {}
-    last_updated = None
+    sql = """
+        SELECT securityId, tradingSymbol, segment, lotSize, expiry
+        FROM instruments
+        WHERE tradingSymbol LIKE ? AND segment = ?
+        LIMIT ?
+    """
+    conn = _connect(db_path)
     try:
-        if os.path.exists(INSTRUMENT_DB_FILE):
-            os.remove(INSTRUMENT_DB_FILE)
-            logger.info("Instruments DB removed: %s", INSTRUMENT_DB_FILE)
-        return {"status": "success"}
-    except Exception as e:
-        logger.exception("Failed cleanup")
-        return {"status": "failed", "message": str(e)}
+        rows = conn.execute(sql, (f"%{query.strip()}%", segment.strip(), int(limit))).fetchall()
+        cols = ["securityId", "tradingSymbol", "segment", "lotSize", "expiry"]
+        return [dict(zip(cols, r)) for r in rows]
+    finally:
+        conn.close()
 
-# Scheduler
-_scheduler: Optional[AsyncIOScheduler] = None
-
-def start_scheduler():
-    global _scheduler
-    if _scheduler and _scheduler.running:
-        logger.info("Scheduler already running")
-        return
-    _scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
-    # Download job at configured time
-    _scheduler.add_job(lambda: _run_download_job(), "cron",
-                       hour=DAILY_DOWNLOAD_HOUR, minute=DAILY_DOWNLOAD_MINUTE,
-                       id="download_instruments", replace_existing=True)
-    # Cleanup job
-    _scheduler.add_job(lambda: _run_cleanup_job(), "cron",
-                       hour=DAILY_CLEANUP_HOUR, minute=DAILY_CLEANUP_MINUTE,
-                       id="cleanup_instruments", replace_existing=True)
-    _scheduler.start()
-    logger.info("Scheduler started (download at %02d:%02d IST, cleanup at %02d:%02d IST)",
-                DAILY_DOWNLOAD_HOUR, DAILY_DOWNLOAD_MINUTE, DAILY_CLEANUP_HOUR, DAILY_CLEANUP_MINUTE)
-    # On startup: if DB current, load; else try immediate non-fatal download
-    if db_is_current():
-        logger.info("Today's DB exists; loading into memory")
-        load_index_from_db()
-    else:
-        # best-effort immediate download but don't crash if fails
-        try:
-            logger.info("Today's DB not present; attempting immediate download")
-            download_and_populate()
-        except Exception as e:
-            logger.exception("Startup download failed (non-fatal)")
-
-def _run_download_job():
+def resolve_symbol(db_path: Optional[str], symbol: str, segment: str) -> Optional[Dict[str, str | int]]:
+    """Exact tradingSymbol + segment → 1 record with securityId, lotSize, expiry."""
+    db_path = db_path or DEFAULT_DB
+    if not symbol or not segment or not os.path.exists(db_path):
+        return None
+    sql = """
+        SELECT securityId, tradingSymbol, segment, lotSize, expiry
+        FROM instruments
+        WHERE LOWER(tradingSymbol) = LOWER(?) AND segment = ?
+        LIMIT 1
+    """
+    conn = _connect(db_path)
     try:
-        download_and_populate()
-        logger.info("Download job finished")
-    except Exception:
-        logger.exception("Download job failed")
+        row = conn.execute(sql, (symbol.strip(), segment.strip())).fetchone()
+        if not row:
+            return None
+        cols = ["securityId", "tradingSymbol", "segment", "lotSize", "expiry"]
+        return dict(zip(cols, row))
+    finally:
+        conn.close()
 
-def _run_cleanup_job():
-    try:
-        cleanup_instruments()
-        logger.info("Cleanup job finished")
-    except Exception:
-        logger.exception("Cleanup job failed")
+# ------------- Scheduler -------------
+_sched: Optional[BackgroundScheduler] = None
+
+def ensure_fresh_db(db_path: str):
+    # If DB missing or suspiciously small, force a download now
+    if (not os.path.exists(db_path)) or (os.path.getsize(db_path) < 10 * 1024 * 1024):
+        download_and_populate(db_path)
+
+def start_scheduler(db_path: Optional[str] = None) -> BackgroundScheduler:
+    """
+    Start cron jobs:
+      - 08:00 Asia/Kolkata: download_and_populate(db_path)
+      - 15:45 Asia/Kolkata: cleanup_instruments(db_path)
+    """
+    global _sched
+    if _sched:
+        return _sched
+
+    db_path = db_path or DEFAULT_DB
+    LOG.info("⏳ Starting scheduler (IST): 08:00 download, 15:45 cleanup | db=%s", db_path)
+
+    _sched = BackgroundScheduler(timezone="Asia/Kolkata")
+    _sched.add_job(lambda: download_and_populate(db_path), "cron", hour=8, minute=0, id="download_job")
+    _sched.add_job(lambda: cleanup_instruments(db_path), "cron", hour=15, minute=45, id="cleanup_job")
+    _sched.start()
+
+    LOG.info("✅ Scheduler started")
+    return _sched

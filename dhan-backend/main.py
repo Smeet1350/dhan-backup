@@ -1,240 +1,295 @@
 # main.py
-import os
+from __future__ import annotations
+
 import logging
-from datetime import datetime, time
-from fastapi import FastAPI, Query
+import os
+import sqlite3
+import time
+import uuid
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 
-# configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("dhan-backend")
+# ====== Add your Dhan credentials here (no .env needed) ======
+DHAN_CLIENT_ID = "1107860004"
+DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU2ODM2NDA4LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNzg2MDAwNCJ9.3cuzgiY0Qm2Id8wpMW0m90_ZxJ0TJRTV5fZ0tpAwWo3S1Mv5HbpcDNwXxXVepnOUHMRDck_AbArIoVOmlA68Dg"
 
-# import scheduler and orders modules we provided
-from scheduler import start_scheduler, instruments_by_symbol, instruments_by_id, last_updated, search_instruments, load_index_from_db, db_is_current
-from orders import (resolve_symbol, place_order_via_dhan,
-                    get_order_list, cancel_order, get_funds, get_holdings, get_positions)
+# Local modules
+from scheduler import (
+    start_scheduler,
+    download_and_populate,
+    cleanup_instruments,
+    db_is_current,
+    symbol_search,
+    resolve_symbol,
+    ensure_fresh_db,
+)
+from orders import (
+    broker_ready,
+    get_funds,
+    get_holdings,
+    get_positions,
+    get_order_list,
+    place_order_via_broker,
+    cancel_order_via_broker,
+    init_broker,
+)
 
-app = FastAPI(title="Dhan Automation Backend")
+# -------- Logging (production-friendly) --------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+LOG = logging.getLogger("backend")
+SQLITE_PATH = os.getenv("INSTRUMENTS_DB", "instruments.db")
 
-# CORS - allow react dev server origins
+# -------- FastAPI app --------
+app = FastAPI(title="Dhan Automation", version="1.0.0")
+
+# CORS middleware must come first (outermost) and include both localhost variants
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting scheduler...")
-    # start scheduler (download at 8AM, cleanup at 4PM)
-    start_scheduler()
-    # ensure DB loaded if exists
+# -------- Request ID middleware for traceability --------
+@app.middleware("http")
+async def add_request_id(request, call_next):
+    import time, uuid, logging
+    LOG = logging.getLogger("backend")
+    rid = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    start = time.time()
+    response = None
     try:
-        if db_is_current():
-            load_index_from_db()
+        response = await call_next(request)
+        return response
     except Exception:
-        logger.exception("Failed to load index at startup (non-fatal)")
+        LOG.exception("Unhandled exception | rid=%s", rid)
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Internal Server Error", "rid": rid},
+        )
+    finally:
+        elapsed = (time.time() - start) * 1000
+        status_code = getattr(response, "status_code", 500)
+        LOG.info(
+            "access | rid=%s method=%s path=%s status=%s elapsed_ms=%.2f",
+            rid, request.method, request.url.path, status_code, elapsed,
+        )
+        if response:
+            response.headers["X-Request-ID"] = rid
 
-# -------------------
-# Health & status
-# -------------------
+# -------- Start scheduler (08:00 IST download / 15:45 IST cleanup) --------
+start_scheduler()
+
+# -------- Ensure instruments DB exists at boot --------
+ensure_fresh_db(SQLITE_PATH)  # SQLITE_PATH is already set in your file
+
+# -------- Initialize broker from main.py creds --------
+ok, why = init_broker(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+if not ok:
+    LOG.error("Broker init failed: %s", why)
+
+LOG.info("Backend boot complete")
+
+# =======================
+# Health / status
+# =======================
 @app.get("/status")
-def status():
-    try:
-        return {
-            "status": "ok",
-            "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "instruments_loaded": bool(instruments_by_id),
-            "instruments_last_updated": last_updated
-        }
-    except Exception as e:
-        logger.exception("Status error")
-        return {"status": "error", "message": str(e)}
+def api_status():
+    ok_db = db_is_current(SQLITE_PATH)
+    ok_broker, why = broker_ready()
+    status = "ok" if ok_broker else "degraded"
+    msg = "Backend running"
+    if not ok_db:
+        msg += " (instrument DB may be outdated)"
+    if not ok_broker:
+        msg += f" (broker not ready: {why})"
+    return {
+        "status": status,
+        "message": msg,
+        "instruments_db_current_today": ok_db,
+        "broker_ready": ok_broker,
+        "why": why,
+    }
 
-# -------------------
-# Instruments endpoints
-# -------------------
-@app.get("/instruments/status")
-def instruments_status():
-    try:
-        return {
-            "status": "success",
-            "last_updated": last_updated,
-            "in_memory_count": len(instruments_by_id),
-            "db_exists": os.path.exists("instruments.db")
-        }
-    except Exception as e:
-        logger.exception("Instruments status error")
-        return {"status": "failed", "message": str(e)}
-
+# =======================
+# Instrument master helpers
+# =======================
 @app.get("/symbol-search")
-def symbol_search(query: str = Query(..., min_length=1), segment: str = Query(None), limit: int = Query(20, ge=1, le=100)):
+def api_symbol_search(
+    query: str = Query(..., min_length=1),
+    segment: str = Query(..., regex="^(NSE_EQ|BSE_EQ|NSE_FNO|MCX)$"),
+    limit: int = Query(30, ge=1, le=100),
+):
     try:
-        results = search_instruments(query, segment, limit)
+        results = symbol_search(SQLITE_PATH, query, segment, limit)
         return {"status": "success", "results": results}
     except Exception as e:
-        logger.exception("Symbol search failed")
-        return {"status": "failed", "message": str(e)}
+        LOG.exception("symbol-search failed")
+        return {"status": "error", "message": str(e), "results": []}
 
-@app.get("/symbol/{symbol}")
-def symbol_lookup(symbol: str):
+@app.post("/instruments/download")
+def api_download_master():
     try:
-        res = resolve_symbol(symbol)
-        return res
+        res = download_and_populate(SQLITE_PATH)
+        return {"status": "success", **res}
     except Exception as e:
-        logger.exception("Symbol lookup failed")
-        return {"status": "failed", "message": str(e)}
-
-@app.post("/instruments/refresh")
-def instruments_refresh():
-    try:
-        res = start_scheduler()  # scheduler will attempt immediate download on startup; provide manual endpoint below if needed
-        # But we want a manual download: call scheduler.download job directly if needed - easiest is to call scheduler's download function
-        # For simplicity, we will call scheduler.download via the module's function if exists.
-        from scheduler import download_and_populate
-        r = download_and_populate()
-        return {"status": "success", "result": r}
-    except Exception as e:
-        logger.exception("Manual instruments refresh failed")
-        return {"status": "failed", "message": str(e)}
+        LOG.exception("manual download failed")
+        return {"status": "error", "message": str(e)}
 
 @app.post("/instruments/cleanup")
-def instruments_cleanup():
+def api_cleanup_master():
     try:
-        from scheduler import cleanup_instruments
-        r = cleanup_instruments()
-        return r
+        res = cleanup_instruments(SQLITE_PATH)
+        return {"status": "success", **res}
     except Exception as e:
-        logger.exception("Manual instruments cleanup failed")
-        return {"status": "failed", "message": str(e)}
+        LOG.exception("manual cleanup failed")
+        return {"status": "error", "message": str(e)}
 
-# -------------------
-# Funds / holdings / positions
-# -------------------
+# =======================
+# Funds / holdings / positions / orders
+# =======================
 @app.get("/funds")
 def api_funds():
-    try:
-        res = get_funds()
-        if res.get("status") and res.get("status").lower() != "success" and res.get("status").lower() != "ok":
-            # some dhanhq responses use "status": "success" or dictionary with status
-            # normalize to {"status":"failed", "message":...}
-            msg = res.get("remarks") or res.get("message") or str(res)
-            return {"status": "failed", "message": str(msg)}
-        return {"status": "success", "funds": res.get("data") or res}
-    except Exception as e:
-        logger.exception("Funds endpoint error")
-        return {"status": "failed", "message": str(e)}
+    return get_funds()
 
 @app.get("/holdings")
 def api_holdings():
-    try:
-        res = get_holdings()
-        logger.info("Holdings raw: %s", res)
-        if res.get("status") and res.get("status").lower() != "success":
-            return {"status": "failed", "message": res.get("remarks") or res.get("message") or str(res)}
-        # Many dhan responses have structure {status, remarks, data: [...]}
-        data = res.get("data") if isinstance(res, dict) else res
-        return {"status": "success", "holdings": data}
-    except Exception as e:
-        logger.exception("Holdings endpoint error")
-        return {"status": "failed", "message": str(e)}
+    return get_holdings()
 
 @app.get("/positions")
 def api_positions():
-    try:
-        res = get_positions()
-        logger.info("Positions raw: %s", res)
-        if res.get("status") and res.get("status").lower() != "success":
-            return {"status": "failed", "message": res.get("remarks") or res.get("message") or str(res)}
-        data = res.get("data") if isinstance(res, dict) else res
-        return {"status": "success", "positions": data}
-    except Exception as e:
-        logger.exception("Positions endpoint error")
-        return {"status": "failed", "message": str(e)}
+    return get_positions()
 
-# -------------------
-# Orders endpoints
-# -------------------
 @app.get("/orders")
-def api_get_orders():
-    try:
-        res = get_order_list()
-        logger.info("Orders raw: %s", res)
-        if res.get("status") and res.get("status").lower() != "success":
-            return {"status": "failed", "message": res.get("remarks") or res.get("message") or str(res)}
-        data = res.get("data") if isinstance(res, dict) else res
-        return {"status": "success", "orders": data}
-    except Exception as e:
-        logger.exception("Get orders endpoint error")
-        return {"status": "failed", "message": str(e)}
+def api_orders():
+    return get_order_list()
 
+# =======================
+# Place / Cancel order
+# =======================
 @app.post("/order/place")
 def api_place_order(
     symbol: str = Query(..., description="Trading symbol, e.g., TCS"),
-    qty: int = Query(..., description="Quantity"),
-    side: str = Query("BUY", description="BUY/SELL"),
-    segment: str = Query(None, description="Optional segment filter like NSE_EQ or NSE_FNO"),
-    order_type: str = Query("MARKET", description="MARKET/LIMIT"),
-    price: float = Query(0.0, description="Limit price if LIMIT"),
-    product_type: str = Query("DELIVERY", description="DELIVERY/INTRADAY"),
-    validity: str = Query("DAY", description="DAY/IOC")
+    segment: str = Query(..., regex="^(NSE_EQ|BSE_EQ|NSE_FNO|MCX)$"),
+    side: str = Query(..., regex="^(BUY|SELL)$"),
+    qty: int = Query(..., ge=1),
+    order_type: str = Query("MARKET", regex="^(MARKET|LIMIT)$"),
+    price: float = Query(0.0, ge=0.0),
+    product_type: str = Query("DELIVERY", regex="^(DELIVERY|CNC|INTRADAY)$"),
+    validity: str = Query("DAY", regex="^(DAY|IOC)$"),
+    security_id: str | None = Query(default=None, description="Optional: pass to skip DB resolve"),
+    x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
 ):
-    try:
-        # check market open roughly (9:00 - 16:00 IST)
-        now_ist = datetime.now().astimezone()
-        if now_ist.weekday() >= 5:
-            return {"status": "failed", "message": "Market closed (weekend)"}
-        # simple hour check - you can improve with calendar
-        if now_ist.hour < 9 or now_ist.hour >= 16:
-            market_notice = "Markets appear closed by clock"
-        else:
-            market_notice = ""
+    rid = x_request_id
+    
+    # Broker guard at the top:
+    ok, why = broker_ready()
+    if not ok:
+        return {"status": "error", "message": f"Broker not ready: {why or 'unknown'}"}
+    
+    # Resolve guard before using inst["securityId"]:
+    if not security_id:
+        inst = resolve_symbol(SQLITE_PATH, symbol, segment)
+        if not inst:
+            sugg = [i["tradingSymbol"] for i in symbol_search(SQLITE_PATH, symbol, segment, 5)] or []
+            return {"status":"error","message":f"Symbol not found in instruments: {symbol} ({segment})","suggestions":sugg}
+        security_id = str(inst["securityId"])
+        lot = int(inst.get("lotSize") or 1)
+    else:
+        lot = 1  # if sent from UI, we can't know lot here; it's fine
 
-        # resolve symbol to instrument(s)
-        res = resolve_symbol(symbol, segment_filter=segment)
-        if res.get("status") != "success":
-            return {"status": "failed", "message": res.get("message")}
+    # Lot check before calling broker:
+    if segment in ("NSE_FNO","MCX") and lot > 1 and qty % lot != 0:
+        return {"status":"error","message":f"Qty must be multiple of lot size ({lot}) for {segment}"}
 
-        inst = res["results"][0]  # choose first match; you can return matches for user to pick
-        security_id = inst["securityId"]
-        exchange_segment = inst.get("segment") or inst.get("exchange") or ""
+    # best-effort lot fetch if not already set
+    if not lot or lot == 1:
+        try:
+            inst = inst or resolve_symbol(SQLITE_PATH, symbol, segment)
+            lot = int((inst or {}).get("lotSize") or 1)
+        except Exception:
+            lot = lot or 1
 
-        # place order via orders module
-        dh_res = place_order_via_dhan(security_id, exchange_segment, side, qty,
-                                      order_type, price, product_type, validity)
-        logger.info("Place order result: %s", dh_res)
-        # dh_res may contain status/key names per Dhan; normalize
-        if dh_res.get("status") and dh_res.get("status").lower() == "success":
-            return {"status": "success", "message": "Order placed", "preview": {
-                "symbol": symbol,
-                "securityId": security_id,
-                "side": side,
-                "qty": qty,
-                "order_type": order_type,
-                "price": price,
-                "product_type": product_type
-            }, "order_response": dh_res, "marketNotice": market_notice}
-        else:
-            msg = dh_res.get("remarks") or dh_res.get("message") or str(dh_res)
-            return {"status": "failed", "message": msg, "preview": {
-                "symbol": symbol,
-                "securityId": security_id
-            }, "marketNotice": market_notice}
-    except Exception as e:
-        logger.exception("Place order error")
-        return {"status": "failed", "message": str(e)}
+    if segment in ("NSE_FNO", "MCX") and lot > 1 and (qty % lot != 0):
+        return {"status":"error","message":f"Qty must be multiple of lot size ({lot}) for {segment}"}
+
+    # Log the exact intent (so you can correlate with UI and broker):
+    LOG.info("➡️ api_place_order | symbol=%s sid=%s seg=%s side=%s qty=%s type=%s price=%s product=%s validity=%s",
+             symbol, security_id, segment, side, qty, order_type, price, product_type, validity)
+
+    res = place_order_via_broker(
+        security_id=security_id,
+        exchange_segment=segment,
+        transaction_type=side,
+        quantity=qty,
+        order_type=order_type,
+        price=price,
+        product_type=product_type,
+        validity=validity,
+    )
+
+    payload = {
+        "rid": rid,
+        "preview": {
+            "symbol": symbol, "segment": segment, "side": side, "qty": qty,
+            "order_type": order_type, "price": price, "product_type": product_type,
+            "validity": validity, "security_id": str(security_id), "lot": lot
+        },
+        "broker": res,
+    }
+    if res.get("status") == "success":
+        return {"status": "success", **payload}
+    else:
+        return {"status": "error", "message": res.get("message") or "Order failed", **payload}
 
 @app.post("/order/cancel")
-def api_cancel_order(order_id: str = Query(..., description="Order ID to cancel")):
+def api_cancel(order_id: str = Query(..., min_length=1)):
+    return cancel_order_via_broker(order_id)
+
+# =======================
+# Debug endpoint
+# =======================
+@app.get("/debug/broker")
+def debug_broker():
+    # Call all four and report their statuses/messages
+    from orders import get_funds, get_holdings, get_positions, get_order_list, broker_ready
+    ok, why = broker_ready()
+    res = {
+        "broker_ready": ok,
+        "why": why,
+        "funds": get_funds(),
+        "holdings": get_holdings(),
+        "positions": get_positions(),
+        "orders": get_order_list(),
+    }
+    return res
+
+@app.get("/debug/resolve")
+def debug_resolve(symbol: str, segment: str):
+    inst = resolve_symbol(SQLITE_PATH, symbol, segment)
+    like = symbol_search(SQLITE_PATH, symbol, segment, limit=5)
+    return {"inst": inst, "suggestions": like}
+
+@app.get("/debug/instruments/count")
+def debug_inst_count():
+    import os, sqlite3
+    if not os.path.exists(SQLITE_PATH):
+        return {"exists": False, "rows": 0}
+    conn = sqlite3.connect(SQLITE_PATH)
     try:
-        res = cancel_order(order_id)
-        logger.info("Cancel result: %s", res)
-        if res.get("status") and res.get("status").lower() == "success":
-            return {"status": "success", "cancel": res}
-        else:
-            return {"status": "failed", "message": res.get("remarks") or res.get("message") or str(res)}
-    except Exception as e:
-        logger.exception("Cancel order error")
-        return {"status": "failed", "message": str(e)}
+        c = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()
+        return {"exists": True, "rows": int(c[0])}
+    finally:
+        conn.close()
