@@ -1,8 +1,9 @@
+// App.jsx
 import React, { useEffect, useRef, useState } from "react";
 import axios from "axios";
 
 // Back-end must run here:
-const BASE_URL = "http://127.0.0.1:8000";
+const BASE_URL = import.meta.env?.VITE_API_URL || `http://${window.location.hostname}:8000`;
 
 function safeMsg(x) {
   if (!x && x !== 0) return "";
@@ -15,18 +16,15 @@ function safeMsg(x) {
 }
 
 export default function App() {
-  // Connection / global
   const [status, setStatus] = useState("Checking...");
   const [statusError, setStatusError] = useState(null);
   const [notif, setNotif] = useState(null);
 
-  // Data
   const [funds, setFunds] = useState(null);
   const [holdings, setHoldings] = useState([]);
   const [positions, setPositions] = useState([]);
   const [orders, setOrders] = useState([]);
 
-  // Place order form
   const [segment, setSegment] = useState("NSE_EQ");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
@@ -38,7 +36,6 @@ export default function App() {
   const [productType, setProductType] = useState("DELIVERY");
   const [validity, setValidity] = useState("DAY");
 
-  // UI state
   const [error, setError] = useState(null);
   const [placing, setPlacing] = useState(false);
   const [loadingOrders, setLoadingOrders] = useState(false);
@@ -51,38 +48,33 @@ export default function App() {
   const log = (...args) => console.log("[UI]", ...args);
   const toast = (m) => { setNotif(m); setTimeout(() => setNotif(null), 4000); };
 
-  // Fetch all core data
   const fetchAll = async () => {
     try {
-      log("GET /status");
       const s = await api.get("/status");
       if (s.data?.status === "ok" || s.data?.status === "degraded") {
         const okDB = s.data?.instruments_db_current_today;
         const okBroker = s.data?.broker_ready;
-        setStatus(
-          `Connected ${okBroker ? "✅" : "⚠️"} ${okDB ? "" : "(Instrument DB outdated)"}`
-        );
+        setStatus(`Connected ${okBroker ? "✅" : "⚠️"} ${okDB ? "" : "(Instrument DB outdated)"}`);
         setStatusError(s.data?.message || null);
       } else {
         setStatus("Not Connected ❌");
-        setStatusError(s.data?.message || "Backend not-ok");
+        setStatusError(s.data?.message || "Backend not reachable at " + BASE_URL);
       }
 
-      log("GET /funds");
       const f = await api.get("/funds");
       setFunds(f.data?.funds ?? null);
 
-      log("GET /holdings");
       const h = await api.get("/holdings");
       setHoldings(h.data?.holdings ?? []);
 
-      log("GET /positions");
       const p = await api.get("/positions");
       setPositions(p.data?.positions ?? []);
     } catch (err) {
+      const msg = "Backend unreachable: " + safeMsg(err.message || err);
       setStatus("Not Connected ❌");
-      setStatusError(safeMsg(err.message || err));
-      setError("Backend unreachable: " + safeMsg(err.message || err));
+      setStatusError(msg);
+      setError(msg);
+      toast("💥 " + msg);
     }
   };
 
@@ -93,16 +85,16 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Orders list
   const fetchOrders = async () => {
     setLoadingOrders(true);
     try {
-      log("GET /orders");
       const r = await api.get("/orders");
       setOrders(r.data?.orders ?? []);
     } catch (e) {
+      const msg = "Error fetching orders: " + safeMsg(e.message || e);
       setOrders([]);
-      setError("Error fetching orders: " + safeMsg(e.message || e));
+      setError(msg);
+      toast("💥 " + msg);
     } finally {
       setLoadingOrders(false);
     }
@@ -113,7 +105,6 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  // Symbol search (debounced)
   useEffect(() => {
     if (!searchQuery || searchQuery.length < 2) {
       setSearchResults([]);
@@ -122,7 +113,6 @@ export default function App() {
     if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
     searchDebounceRef.current = setTimeout(async () => {
       try {
-        log("GET /symbol-search", searchQuery, segment);
         const res = await api.get("/symbol-search", { params: { query: searchQuery, segment } });
         setSearchResults(res.data?.results ?? []);
       } catch {
@@ -136,12 +126,11 @@ export default function App() {
   }, [searchQuery, segment]);
 
   const pickInstrument = (inst) => {
-    setSelectedInstrument(inst);
+    setSelectedInstrument({ ...inst, security_id: String(inst.securityId) });
     setSearchQuery(inst.tradingSymbol + (inst.expiry ? ` ${inst.expiry}` : ""));
     setSearchResults([]);
   };
 
-  // Place order
   const handlePlaceOrder = async (e) => {
     e.preventDefault();
     setPlacing(true);
@@ -153,35 +142,53 @@ export default function App() {
         setPlacing(false);
         return;
       }
+      let securityId = selectedInstrument?.securityId ?? selectedInstrument?.security_id;
+      if (!securityId) {
+        try {
+          const r = await api.get(`${BASE_URL}/resolve-symbol`, {
+            params: { symbol: selectedInstrument.tradingSymbol, segment: selectedInstrument.segment }
+          });
+          if (r.data && r.data.inst) {
+            securityId = String(r.data.inst.securityId);
+            setSelectedInstrument(prev => ({ ...prev, security_id: securityId }));
+          } else {
+            throw new Error(r.data?.message || "Could not resolve symbol");
+          }
+        } catch (e) {
+          const msg = `❌ Resolve failed: ${safeMsg(e)}`;
+          setError(msg);
+          toast(msg);
+          setPlacing(false);
+          return;
+        }
+      }
+
       const params = {
         symbol: selectedInstrument.tradingSymbol,
+        security_id: securityId,
         segment,
         side,
-        qty,
+        qty: Number(qty),
         order_type: orderType,
-        price: orderType === "LIMIT" ? parseFloat(price || 0) : 0,
-        product_type: productType,         // "DELIVERY" or "INTRADAY" is fine; backend maps to CNC/INTRA
+        price: Number(price) || 0,
+        product_type: productType,
         validity,
-        security_id: selectedInstrument.securityId,   // ← IMPORTANT
       };
-      log("POST /order/place", params);
       const res = await api.post("/order/place", null, { params });
-      const msg = res.data?.message || res.data?.broker?.message || "Order failed";
-      if (res.data?.status !== "success") {
-        setError("Order failed: " + msg);
-        console.log("order/place failed:", res.data); // keep for debugging
-      } else {
-        // success toast, then refresh orders
-        toast("✅ " + msg);
+      if (res.data.status === "success") {
+        toast("✅ Order placed successfully!");
         setMarketNotice(res.data?.broker?.message || "");
         await fetchOrders();
         await fetchAll();
+      } else {
+        const msg = `❌ Order failed [rid ${res.data.rid}]: ${safeMsg(res.data.broker)}`;
+        setError(msg);
+        toast("💥 " + msg);
       }
     } catch (e1) {
       const msg = "Error placing order: " + safeMsg(e1.message || e1);
       setError(msg);
       toast("💥 " + msg);
-      log("order/place exception", e1);
     } finally {
       setPlacing(false);
     }
@@ -191,7 +198,6 @@ export default function App() {
     if (!orderId) return;
     if (!window.confirm(`Cancel order ${orderId}?`)) return;
     try {
-      log("POST /order/cancel", orderId);
       const res = await api.post("/order/cancel", null, { params: { order_id: orderId } });
       if (res.data?.status === "success") {
         toast("Order cancelled ✅");
@@ -331,7 +337,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Place order form */}
           <form className="mt-3 grid grid-cols-1 md:grid-cols-6 gap-2 items-end" onSubmit={handlePlaceOrder}>
             <div className="md:col-span-2">
               <label className="block text-xs text-gray-400">Segment</label>
@@ -343,17 +348,32 @@ export default function App() {
               </select>
             </div>
 
-            <div className="md:col-span-2">
+            <div className="md:col-span-2 relative">
               <label className="block text-xs text-gray-400">Symbol / Search</label>
-              <input
-                type="text"
-                className="input"
-                placeholder="Type symbol (e.g. TCS or NIFTY24SEP...)"
-                value={searchQuery}
-                onChange={(e) => { setSearchQuery(e.target.value); setSelectedInstrument(null); }}
-              />
+              <div className="relative">
+                <input
+                  type="text"
+                  className="input pr-8"
+                  placeholder="Type symbol (e.g. TCS or NIFTY24SEP...)"
+                  value={searchQuery}
+                  onChange={(e) => { setSearchQuery(e.target.value); setSelectedInstrument(null); }}
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
+                    onClick={() => { setSearchQuery(""); setSelectedInstrument(null); setSearchResults([]); }}
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+
               {searchResults.length > 0 && (
                 <ul className="bg-gray-800 mt-1 rounded max-h-44 overflow-auto border border-gray-700">
+                  <div className="bg-gray-900 text-xs px-2 py-1 text-gray-400 border-b border-gray-700">
+                    Showing results in {segment}
+                  </div>
                   {searchResults.map((s) => (
                     <li key={s.securityId} className="p-2 hover:bg-gray-700 cursor-pointer text-sm" onClick={() => pickInstrument(s)}>
                       <div className="flex justify-between">
@@ -364,6 +384,11 @@ export default function App() {
                     </li>
                   ))}
                 </ul>
+              )}
+              {searchQuery && searchResults.length === 0 && (
+                <div className="text-xs opacity-70 mt-1">
+                  No results. Check Instruments status or try exact symbol.
+                </div>
               )}
             </div>
 
@@ -404,14 +429,15 @@ export default function App() {
                 <option value="DAY">DAY</option>
                 <option value="IOC">IOC</option>
               </select>
-              <button type="submit" className="bg-green-600 px-4 py-2 rounded hover:bg-green-700" disabled={placing || !selectedInstrument?.securityId}>
+              <button type="submit" className="bg-green-600 px-4 py-2 rounded hover:bg-green-700"
+                disabled={placing || !(selectedInstrument?.securityId || selectedInstrument?.security_id)}>
                 {placing ? "Placing..." : "Place Order"}
               </button>
 
               <div className="ml-auto text-sm text-gray-400">
                 {selectedInstrument ? (
                   <div>
-                    <div><strong>Selected:</strong> {selectedInstrument.tradingSymbol} (ID: {selectedInstrument.securityId})</div>
+                    <div><strong>Selected:</strong> {selectedInstrument.tradingSymbol} (ID: {selectedInstrument.securityId || selectedInstrument.security_id})</div>
                     <div className="text-xs">Segment: {selectedInstrument.segment} • lot: {selectedInstrument.lotSize}</div>
                   </div>
                 ) : (
@@ -424,7 +450,6 @@ export default function App() {
           {marketNotice && <div className="mt-2 text-yellow-300 text-sm">{marketNotice}</div>}
           <hr className="my-3 border-gray-700" />
 
-          {/* Order Book */}
           <div>
             <h3 className="font-semibold">Order Book</h3>
             {loadingOrders ? (
