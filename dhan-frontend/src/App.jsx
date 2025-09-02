@@ -39,6 +39,8 @@ export default function App() {
   const [placing, setPlacing] = useState(false);
   const [loadingOrders, setLoadingOrders] = useState(false);
   const [marketNotice, setMarketNotice] = useState("");
+  const [exitModal, setExitModal] = useState(null); 
+  // null or {symbol, segment, securityId, qty, side}
 
   const pollRef = useRef(null);
   const searchDebounceRef = useRef(null);
@@ -270,6 +272,7 @@ export default function App() {
                     <th className="p-2">Avg</th>
                     <th className="p-2">LTP</th>
                     <th className="p-2">P&L</th>
+                    <th className="p-2">Action</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -285,6 +288,18 @@ export default function App() {
                         <td className="p-2">₹{money(avg)}</td>
                         <td className="p-2">₹{money(ltp)}</td>
                         <td className={`p-2 ${pnl >= 0 ? "text-green-400" : "text-red-400"}`}>₹{money(pnl)}</td>
+                        <td className="p-2">
+                          <button className="btn-danger" onClick={() => setExitModal({
+                            source: "holding",
+                            symbol: h.tradingSymbol,
+                            segment: h.segment || "NSE_EQ",
+                            securityId: h.securityId,
+                            qty: qtyv,
+                            side: "SELL", // always sell holdings
+                          })}>
+                            Exit
+                          </button>
+                        </td>
                       </tr>
                     );
                   })}
@@ -307,6 +322,7 @@ export default function App() {
                     <th className="p-2">Avg</th>
                     <th className="p-2">LTP</th>
                     <th className="p-2">P&L</th>
+                    <th className="p-2">Action</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -322,6 +338,18 @@ export default function App() {
                         <td className="p-2">₹{money(avg)}</td>
                         <td className="p-2">₹{money(ltp)}</td>
                         <td className={`p-2 ${pnl >= 0 ? "text-green-400" : "text-red-400"}`}>₹{money(pnl)}</td>
+                        <td className="p-2">
+                          <button className="btn-danger" onClick={() => setExitModal({
+                            source: "position",
+                            symbol: p.tradingSymbol,
+                            segment: p.segment || "NSE_EQ",
+                            securityId: p.securityId,
+                            qty: Math.abs(qtyv),
+                            side: qtyv > 0 ? "SELL" : "BUY", // opposite to close
+                          })}>
+                            Exit
+                          </button>
+                        </td>
                       </tr>
                     );
                   })}
@@ -508,6 +536,95 @@ export default function App() {
           Polling every 10s • Backend: {BASE_URL}
         </footer>
       </div>
+
+      {exitModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-gray-800 p-6 rounded-xl shadow-xl w-full max-w-md">
+            <h3 className="text-lg font-semibold mb-3">Square Off: {exitModal.symbol}</h3>
+
+            <div className="space-y-2">
+              <div>
+                <label className="block text-xs text-gray-400">Quantity</label>
+                <input type="number" className="input"
+                  value={exitModal.qty}
+                  onChange={(e)=>setExitModal({...exitModal, qty: Number(e.target.value)})}/>
+              </div>
+
+              <div>
+                <label className="block text-xs text-gray-400">Order Type</label>
+                <select className="select"
+                  value={exitModal.orderType || "MARKET"}
+                  onChange={(e)=>setExitModal({...exitModal, orderType: e.target.value})}>
+                  <option value="MARKET">MARKET</option>
+                  <option value="LIMIT">LIMIT</option>
+                </select>
+              </div>
+
+              {exitModal.orderType === "LIMIT" && (
+                <div>
+                  <label className="block text-xs text-gray-400">Price</label>
+                  <input type="number" step="0.01" className="input"
+                    value={exitModal.price || ""}
+                    onChange={(e)=>setExitModal({...exitModal, price: e.target.value})}/>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs text-gray-400">Product</label>
+                <select className="select"
+                  value={exitModal.productType || "INTRADAY"}
+                  onChange={(e)=>setExitModal({...exitModal, productType: e.target.value})}>
+                  <option value="DELIVERY">DELIVERY/CNC</option>
+                  <option value="INTRADAY">INTRADAY/MIS</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs text-gray-400">Validity</label>
+                <select className="select"
+                  value={exitModal.validity || "DAY"}
+                  onChange={(e)=>setExitModal({...exitModal, validity: e.target.value})}>
+                  <option value="DAY">DAY</option>
+                  <option value="IOC">IOC</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="flex gap-2 justify-end mt-4">
+              <button className="btn" onClick={()=>setExitModal(null)}>Cancel</button>
+              <button className="btn-danger"
+                onClick={async ()=>{
+                  try {
+                    const params = {
+                      symbol: exitModal.symbol,
+                      segment: exitModal.segment,
+                      side: exitModal.side,
+                      qty: exitModal.qty,
+                      order_type: exitModal.orderType || "MARKET",
+                      price: Number(exitModal.price) || 0,
+                      product_type: exitModal.productType || "INTRADAY",
+                      validity: exitModal.validity || "DAY",
+                      security_id: exitModal.securityId,
+                    };
+                    const res = await api.post("/order/place", null, { params });
+                    if (res.data.status === "success") {
+                      toast("✅ Square off order placed!");
+                      fetchAll();
+                      fetchOrders();
+                      setExitModal(null);
+                    } else {
+                      toast("❌ " + safeMsg(res.data.message));
+                    }
+                  } catch (err) {
+                    toast("💥 Error: " + safeMsg(err.message || err));
+                  }
+                }}>
+                Confirm Exit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
