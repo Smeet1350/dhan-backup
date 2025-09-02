@@ -33,6 +33,7 @@ from orders import (
     place_order_via_broker,
     cancel_order_via_broker,
     init_broker,
+    normalize_response,
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -85,7 +86,12 @@ async def add_request_id(request, call_next):
             response.headers["X-Request-ID"] = rid
 
 start_scheduler()
-ensure_fresh_db(SQLITE_PATH)
+db_fresh = ensure_fresh_db(SQLITE_PATH)
+
+# Extra check: if still outdated, force download
+if not db_is_current(SQLITE_PATH):
+    LOG.warning("Instrument DB outdated — forcing fresh download now")
+    download_and_populate(SQLITE_PATH)
 
 ok, why = init_broker(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
 if not ok:
@@ -101,6 +107,8 @@ def api_status():
     msg = "Backend running"
     if not ok_db:
         msg += " (instrument DB may be outdated)"
+    if db_fresh:
+        msg += " (Instrument DB auto-refreshed)"
     if not ok_broker:
         msg += f" (broker not ready: {why})"
     return {
@@ -159,19 +167,19 @@ def api_cleanup_master():
 
 @app.get("/funds")
 def api_funds():
-    return get_funds()
+    return normalize_response(get_funds(), success_msg="Funds retrieved", error_msg="Funds fetch failed")
 
 @app.get("/holdings")
 def api_holdings():
-    return get_holdings()
+    return normalize_response(get_holdings(), success_msg="Holdings retrieved", error_msg="Holdings fetch failed")
 
 @app.get("/positions")
 def api_positions():
-    return get_positions()
+    return normalize_response(get_positions(), success_msg="Positions retrieved", error_msg="Positions fetch failed")
 
 @app.get("/orders")
 def api_orders():
-    return get_order_list()
+    return normalize_response(get_order_list(), success_msg="Orders retrieved", error_msg="Orders fetch failed")
 
 @app.post("/order/place")
 def api_place_order(
@@ -216,7 +224,7 @@ def api_place_order(
         return {"status": "error", "rid": rid, "message": f"Qty must be multiple of lot size ({lot})"}
 
     LOG.debug("(%s) calling place_order_via_broker sid=%s", rid, security_id)
-    res = place_order_via_broker(
+    raw_res = place_order_via_broker(
         security_id=security_id,
         segment=segment,
         side=side,
@@ -228,26 +236,26 @@ def api_place_order(
         symbol=symbol,
         disclosed_qty=disclosed_qty,
     )
-
-    elapsed = round(time.time() - t0, 3)
-    LOG.info("(%s) /order/place end in %ss", rid, elapsed)
-
-    return {
+    normalized = normalize_response(raw_res, success_msg="Order placed successfully", error_msg="Order rejected")
+    elapsed = time.time() - t0
+    # Always ensure JSONResponse returns immediately
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content={
         "rid": rid,
-        "status": res.get("status", "unknown") if isinstance(res, dict) else "unknown",
+        **normalized,
         "preview": {
             "symbol": symbol, "segment": segment, "side": side, "qty": int(qty),
             "order_type": order_type, "price": float(price or 0),
             "product_type": product_type, "validity": validity,
             "security_id": str(security_id), "lot": lot
         },
-        "broker": res,
         "elapsed_s": elapsed,
-    }
+    })
 
 @app.post("/order/cancel")
 def api_cancel(order_id: str = Query(..., min_length=1)):
-    return cancel_order_via_broker(order_id)
+    raw_res = cancel_order_via_broker(order_id)
+    return normalize_response(raw_res, success_msg="Order cancelled", error_msg="Cancel failed")
 
 @app.post("/order/place-simple")
 def api_place_order_simple(
@@ -276,7 +284,7 @@ def api_place_order_simple(
         symbol="",
         disclosed_qty=0,
     )
-    return {"status": res.get("status", "unknown") if isinstance(res, dict) else "unknown", "broker": res}
+    return normalize_response(res, success_msg="Order placed successfully", error_msg="Order rejected")
 
 @app.get("/debug/broker")
 def debug_broker():

@@ -9,7 +9,6 @@ function safeMsg(x) {
   if (!x && x !== 0) return "";
   if (typeof x === "string") return x;
   if (typeof x === "object") {
-    if (x.message) return String(x.message);
     try { return JSON.stringify(x); } catch { return String(x); }
   }
   return String(x);
@@ -44,7 +43,7 @@ export default function App() {
   const pollRef = useRef(null);
   const searchDebounceRef = useRef(null);
 
-  const api = axios.create({ baseURL: BASE_URL, timeout: 15000 });
+  const api = axios.create({ baseURL: BASE_URL, timeout: 30000 }); // 30s instead of 15s
   const log = (...args) => console.log("[UI]", ...args);
   const toast = (m) => { setNotif(m); setTimeout(() => setNotif(null), 4000); };
 
@@ -62,13 +61,13 @@ export default function App() {
       }
 
       const f = await api.get("/funds");
-      setFunds(f.data?.funds ?? null);
+      setFunds(f.data?.data ?? null);
 
       const h = await api.get("/holdings");
-      setHoldings(h.data?.holdings ?? []);
+      setHoldings(h.data?.data ?? []);
 
       const p = await api.get("/positions");
-      setPositions(p.data?.positions ?? []);
+      setPositions(p.data?.data ?? []);
     } catch (err) {
       const msg = "Backend unreachable: " + safeMsg(err.message || err);
       setStatus("Not Connected ❌");
@@ -89,7 +88,7 @@ export default function App() {
     setLoadingOrders(true);
     try {
       const r = await api.get("/orders");
-      setOrders(r.data?.orders ?? []);
+      setOrders(r.data?.data ?? []);
     } catch (e) {
       const msg = "Error fetching orders: " + safeMsg(e.message || e);
       setOrders([]);
@@ -177,18 +176,25 @@ export default function App() {
       const res = await api.post("/order/place", null, { params });
       if (res.data.status === "success") {
         toast("✅ Order placed successfully!");
-        setMarketNotice(res.data?.broker?.message || "");
+        setMarketNotice(res.data?.message || "");
         await fetchOrders();
         await fetchAll();
       } else {
-        const msg = `❌ Order failed [rid ${res.data.rid}]: ${safeMsg(res.data.broker)}`;
+        const msg = `❌ Order failed [rid ${res.data.rid}]: ${safeMsg(res.data.message)}`;
         setError(msg);
         toast("💥 " + msg);
       }
     } catch (e1) {
-      const msg = "Error placing order: " + safeMsg(e1.message || e1);
-      setError(msg);
-      toast("💥 " + msg);
+      // If backend actually responded with a payload, show that
+      if (e1.response && e1.response.data) {
+        const msg = `❌ Order failed [rid ${e1.response.data.rid || "-"}]: ${safeMsg(e1.response.data.message)}`;
+        setError(msg);
+        toast("💥 " + msg);
+      } else {
+        const msg = "Network/timeout error while placing order — check backend logs";
+        setError(msg);
+        toast("💥 " + msg);
+      }
     } finally {
       setPlacing(false);
     }
@@ -238,11 +244,13 @@ export default function App() {
         <section className="card">
           <h2 className="font-semibold text-lg text-green-300">💰 Funds</h2>
           {funds ? (
-            <div className="grid grid-cols-2 gap-4 mt-2 text-sm">
-              <div>Available: ₹{money(funds.availabelBalance ?? funds.available ?? funds.avail ?? funds.availableBalance)}</div>
-              <div>Withdrawable: ₹{money(funds.withdrawableBalance ?? funds.withdrawable ?? funds.withdraw)}</div>
-              <div>SOD Limit: ₹{money(funds.sodLimit ?? funds.sodLimit)}</div>
-              <div>Collateral: ₹{money(funds.collateralAmount ?? funds.collateral)}</div>
+            <div className="overflow-auto max-h-96 mt-2">
+              <div className="grid grid-cols-2 gap-4 text-sm">
+                <div>Available: ₹{money(funds.availabelBalance ?? funds.available ?? funds.avail ?? funds.availableBalance)}</div>
+                <div>Withdrawable: ₹{money(funds.withdrawableBalance ?? funds.withdrawable ?? funds.withdraw)}</div>
+                <div>SOD Limit: ₹{money(funds.sodLimit ?? funds.sodLimit)}</div>
+                <div>Collateral: ₹{money(funds.collateralAmount ?? funds.collateral)}</div>
+              </div>
             </div>
           ) : (
             <div className="text-gray-400 text-sm mt-2">Funds not available</div>
@@ -253,7 +261,7 @@ export default function App() {
         <section className="card">
           <h2 className="font-semibold text-lg text-yellow-300">📦 Holdings</h2>
           {holdings.length > 0 ? (
-            <div className="overflow-auto mt-2">
+            <div className="overflow-auto max-h-96 mt-2">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-left text-gray-300">
@@ -290,7 +298,7 @@ export default function App() {
         <section className="card">
           <h2 className="font-semibold text-lg text-purple-300">📌 Positions</h2>
           {positions.length > 0 ? (
-            <div className="overflow-auto mt-2">
+            <div className="overflow-auto max-h-96 mt-2">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-left text-gray-300">
@@ -455,7 +463,7 @@ export default function App() {
             {loadingOrders ? (
               <div className="text-sm text-gray-400 mt-2">Loading orders...</div>
             ) : orders && orders.length > 0 ? (
-              <div className="overflow-auto mt-2">
+              <div className="overflow-auto max-h-96 mt-2">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-left text-gray-300">
