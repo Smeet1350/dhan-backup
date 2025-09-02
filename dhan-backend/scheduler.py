@@ -213,9 +213,24 @@ def resolve_symbol(db_path: Optional[str], symbol: str, segment: str) -> Optiona
 # ------------- Scheduler -------------
 _sched: Optional[BackgroundScheduler] = None
 
-def ensure_fresh_db(db_path: str):
-    if (not os.path.exists(db_path)) or (os.path.getsize(db_path) < 10 * 1024 * 1024):
+def ensure_fresh_db(db_path: str) -> bool:
+    """
+    Ensure instruments DB exists and is from today.
+    Returns True if a fresh download was triggered.
+    """
+    from datetime import datetime
+    if not os.path.exists(db_path):
         download_and_populate(db_path)
+        return True
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(db_path))
+        if mtime.date() != datetime.now().date():
+            download_and_populate(db_path)
+            return True
+    except Exception:
+        download_and_populate(db_path)
+        return True
+    return False
 
 def start_scheduler(db_path: Optional[str] = None) -> BackgroundScheduler:
     global _sched
