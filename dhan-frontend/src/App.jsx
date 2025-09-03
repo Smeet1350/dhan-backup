@@ -1,6 +1,7 @@
 // App.jsx
 import React, { useEffect, useRef, useState } from "react";
 import axios from "axios";
+import Alerts from "./Alerts";
 
 // Back-end must run here:
 const BASE_URL = import.meta.env?.VITE_API_URL || `http://${window.location.hostname}:8000`;
@@ -241,6 +242,9 @@ export default function App() {
             <strong>Error:</strong> {safeMsg(error)}
           </div>
         )}
+
+        {/* Webhook Alerts */}
+        <Alerts />
 
         {/* Funds */}
         <section className="card">

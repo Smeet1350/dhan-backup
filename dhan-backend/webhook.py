@@ -12,6 +12,10 @@ from config import SQLITE_PATH
 LOG = logging.getLogger("webhook")
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 
+# Global alerts log - newest first
+ALERTS_LOG = []
+MAX_ALERTS = 100
+
 
 def parse_expiry(exp_str: str):
     """Robust expiry date parsing."""
@@ -160,8 +164,27 @@ async def webhook_trade(req: Request):
             symbol=inst["tradingSymbol"],
             disclosed_qty=0,
         )
-        return normalize_response(raw_res, success_msg="Order placed via webhook", error_msg="Webhook order failed")
+        result = normalize_response(raw_res, success_msg="Order placed via webhook", error_msg="Webhook order failed")
+
+        # Attach request info to alerts log
+        alert_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "request": body,
+            "instrument": inst,
+            "response": result,
+        }
+        ALERTS_LOG.insert(0, alert_entry)
+        if len(ALERTS_LOG) > MAX_ALERTS:
+            ALERTS_LOG.pop()
+
+        return result
 
     except Exception as e:
         LOG.exception("Webhook trade failed")
         return {"status": "error", "message": str(e)}
+
+
+@router.get("/alerts")
+def get_alerts():
+    """Get recent webhook alerts."""
+    return {"status": "success", "alerts": ALERTS_LOG}
