@@ -1,6 +1,7 @@
 # webhook.py
 import logging
 import sqlite3
+import uuid
 from datetime import datetime
 from fastapi import APIRouter, Request
 from dateutil import parser
@@ -169,6 +170,7 @@ async def webhook_trade(req: Request):
 
         # Attach request info to alerts log
         alert_entry = {
+            "id": str(uuid.uuid4()),
             "timestamp": datetime.now().isoformat(),
             "request": body,
             "instrument": inst,
