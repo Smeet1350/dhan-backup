@@ -17,29 +17,29 @@ def test_trade(payload):
 
 
 if __name__ == "__main__":
-    # Example 1: BANKNIFTY CE buy (using actual strike from DB)
+    # Example 1: BANKNIFTY CE buy with strike rounding (45987 -> 46000)
     trade1 = {
         "index": "BANKNIFTY",
-        "strike": 31500,
+        "strike": 45987,  # Will be rounded to 46000
         "option_type": "CE",
         "side": "BUY",
-        "qty": 35,
+        "lots": 1,  # New lots parameter
         "order_type": "MARKET",
         "price": 0
     }
 
-    # Example 2: NIFTY PE sell (limit order, 2 lots - using actual strike)
+    # Example 2: NIFTY PE sell with strike rounding (20023 -> 20000)
     trade2 = {
         "index": "NIFTY",
-        "strike": 20000,
+        "strike": 20023,  # Will be rounded to 20000
         "option_type": "PE",
         "side": "SELL",
-        "qty": 150,
+        "lots": 2,  # 2 lots
         "order_type": "LIMIT",
         "price": 105.5
     }
 
-    # Example 3: BANKNIFTY PE buy (no qty → defaults to 1 lot)
+    # Example 3: BANKNIFTY PE buy (no qty/lots → defaults to 1 lot)
     trade3 = {
         "index": "BANKNIFTY",
         "strike": 33000,
@@ -47,6 +47,16 @@ if __name__ == "__main__":
         "side": "BUY"
     }
 
+    # Example 4: Backward compatibility with qty parameter
+    trade4 = {
+        "index": "NIFTY",
+        "strike": 20000,
+        "option_type": "CE",
+        "side": "BUY",
+        "qty": 75,  # Old qty parameter still works
+        "order_type": "MARKET"
+    }
+
     # Run tests
-    for t in [trade1, trade2, trade3]:
+    for t in [trade1, trade2, trade3, trade4]:
         test_trade(t)

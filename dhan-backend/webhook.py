@@ -40,6 +40,12 @@ def infer_segment_from_symbol(symbol: str) -> str:
     return "NSE_FNO"  # safe default
 
 
+def round_strike(strike: int, index_symbol: str) -> int:
+    """Round strike price to valid trading levels based on index."""
+    step = 50 if "NIFTY" in index_symbol.upper() else 100
+    return round(strike / step) * step
+
+
 def find_instrument(db_path: str, index_symbol: str, strike: int, option_type: str) -> dict:
     """Find instrument based on actual DB format."""
     conn = sqlite3.connect(db_path)
@@ -91,27 +97,40 @@ async def webhook_trade(req: Request):
             return {"status": "error", "message": f"Broker not ready: {why}"}
 
         index_symbol = str(body.get("index", "")).upper()
-        strike = int(body.get("strike", 0))
+        raw_strike = int(body.get("strike", 0))
         option_type = str(body.get("option_type", "")).upper()
         side = str(body.get("side", "BUY")).upper()
-        qty = int(body.get("qty", 0))
         order_type = str(body.get("order_type", "MARKET")).upper()
         price = float(body.get("price") or 0)
         product_type = str(body.get("product_type", "INTRADAY")).upper()
         validity = str(body.get("validity", "DAY")).upper()
 
-        if not index_symbol or strike <= 0 or option_type not in ("CE", "PE"):
+        if not index_symbol or raw_strike <= 0 or option_type not in ("CE", "PE"):
             return {"status": "error", "message": "Invalid input"}
+
+        # Round strike to valid trading levels
+        strike = round_strike(raw_strike, index_symbol)
+        LOG.info("Strike rounded: %s -> %s (%s)", raw_strike, strike, index_symbol)
 
         inst = find_instrument(SQLITE_PATH, index_symbol, strike, option_type)
         if not inst:
             return {"status": "error", "message": f"No instrument found for {index_symbol} {strike}{option_type}"}
 
-        lot = int(inst["lotSize"])
-        if qty <= 0:
-            qty = lot
-        elif qty % lot != 0:
-            return {"status": "error", "message": f"Qty {qty} not multiple of lot {lot}"}
+        lot_size = int(inst.get("lotSize") or 1)
+
+        # Quantity calculation
+        lots = int(body.get("lots", 0))   # new param
+        qty = int(body.get("qty", 0))     # backward-compatible
+
+        if lots > 0:
+            qty = lots * lot_size
+        elif qty > 0:
+            if qty % lot_size != 0:
+                return {"status": "error", "message": f"Qty {qty} not multiple of lot {lot_size}"}
+        else:
+            qty = lot_size  # default to 1 lot if nothing given
+
+        LOG.info("Order qty resolved: lots=%s lotSize=%s -> qty=%s", lots, lot_size, qty)
 
         # Instrument validation
         if not inst.get("securityId"):
