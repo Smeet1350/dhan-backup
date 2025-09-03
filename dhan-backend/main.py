@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ====== Add your Dhan credentials here (no .env needed) ======
 DHAN_CLIENT_ID = "1107860004"
-DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU2ODM2NDA4LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNzg2MDAwNCJ9.3cuzgiY0Qm2Id8wpMW0m90_ZxJ0TJRTV5fZ0tpAwWo3S1Mv5HbpcDNwXxXVepnOUHMRDck_AbArIoVOmlA68Dg"
+DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU5NDI4NjYwLCJpYXQiOjE3NTY4MzY2NjAsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA3ODYwMDA0In0.ItPA3IuAidky2QpjG89uD0S60ysgAURoEDhaNrirzc6e1JENEbh3rij9wRPXgDjE_1Lkoovo5Qw5cCjLevRzhg"
 
 from scheduler import (
     start_scheduler,
@@ -24,6 +24,7 @@ from scheduler import (
     resolve_symbol,
     ensure_fresh_db,
 )
+from webhook import router as webhook_router
 from orders import (
     broker_ready,
     get_funds,
@@ -43,7 +44,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOG = logging.getLogger("backend")
-SQLITE_PATH = os.getenv("INSTRUMENTS_DB", "instruments.db")
+from config import SQLITE_PATH
 
 app = FastAPI(title="Dhan Automation", version="1.0.0")
 
@@ -57,6 +58,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(webhook_router)
 
 @app.middleware("http")
 async def add_request_id(request, call_next):

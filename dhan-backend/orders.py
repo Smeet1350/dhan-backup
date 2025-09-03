@@ -68,8 +68,16 @@ def normalize_response(res, success_msg="Success", error_msg="Error"):
     try:
         # Exceptions
         if isinstance(res, Exception):
-            return {"status": "error", "message": str(res) or error_msg,
-                    "broker": {"raw": str(res)}, "data": None}
+            import traceback
+            return {
+                "status": "error",
+                "message": str(res) or error_msg,
+                "broker": {
+                    "raw": str(res),
+                    "trace": traceback.format_exc()
+                },
+                "data": None
+            }
 
         # Strings
         if isinstance(res, str):
@@ -138,7 +146,7 @@ def place_order_via_broker(
             "price": 0.0 if order_type == "MARKET" else float(price),
             "disclosed_quantity": int(disclosed_qty or 0),
         }
-        logger.info("Placing order payload=%s | symbol=%s", payload, symbol)
+        logger.info("Placing order: payload=%s", payload)
         return _dhan.place_order(**payload)   # return raw, no normalization
     except Exception as e:
         logger.exception("place_order_via_broker failed")

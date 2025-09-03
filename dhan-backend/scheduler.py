@@ -58,7 +58,12 @@ def _pick(df: pd.DataFrame, names: List[str]) -> Optional[str]:
             return n
     return None
 
-def _norm_segment(code, txt) -> Optional[str]:
+def _norm_segment(code, txt, trading_symbol: str = "") -> Optional[str]:
+    # Check trading symbol first for options
+    t = str(trading_symbol).upper()
+    if any(idx in t for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")):
+        return "NSE_FNO"
+    
     if pd.notna(code):
         if isinstance(code, (int, float, np.integer, np.floating)) and not pd.isna(code):
             s = str(int(code))
@@ -109,7 +114,7 @@ def download_and_populate(db_path: Optional[str] = None) -> Dict[str, str | int]
         out["securityId"] = df[sec_col].astype(str)
         out["tradingSymbol"] = df[ts_col].astype(str)
         out["segment"] = [
-            _norm_segment(df[segc].iloc[i] if segc else None, df[segt].iloc[i] if segt else None)
+            _norm_segment(df[segc].iloc[i] if segc else None, df[segt].iloc[i] if segt else None, df[ts_col].iloc[i])
             for i in range(len(df))
         ]
         out["lotSize"] = pd.to_numeric(df[lot_col], errors="coerce").fillna(1).astype(int) if lot_col else 1
