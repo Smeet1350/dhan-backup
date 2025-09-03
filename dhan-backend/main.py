@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import os
 import sqlite3
 import time
@@ -44,6 +45,16 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOG = logging.getLogger("backend")
+
+# Setup alerts logging with daily rotation
+handler = TimedRotatingFileHandler("alerts.log", when="midnight", backupCount=7)
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+handler.setFormatter(formatter)
+
+alerts_logger = logging.getLogger("alerts")
+alerts_logger.setLevel(logging.INFO)
+alerts_logger.addHandler(handler)
+
 from config import SQLITE_PATH
 
 app = FastAPI(title="Dhan Automation", version="1.0.0")

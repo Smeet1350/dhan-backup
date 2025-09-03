@@ -7,7 +7,15 @@ export default function Alerts() {
     try {
       const res = await fetch("http://127.0.0.1:8000/webhook/alerts");
       const data = await res.json();
-      if (data.status === "success") setAlerts(data.alerts);
+      if (data.status === "success") {
+        // attach expiry timestamp = now + 20s
+        const now = Date.now();
+        const updated = data.alerts.map(a => ({
+          ...a,
+          _expiry: now + 20000,
+        }));
+        setAlerts(updated);
+      }
     } catch (e) {
       console.error("Failed to fetch alerts", e);
     }
@@ -15,8 +23,14 @@ export default function Alerts() {
 
   useEffect(() => {
     fetchAlerts();
-    const id = setInterval(fetchAlerts, 5000); // refresh every 5s
-    return () => clearInterval(id);
+    const poll = setInterval(fetchAlerts, 5000);
+    const clean = setInterval(() => {
+      setAlerts(prev => prev.filter(a => Date.now() < a._expiry));
+    }, 1000); // clean every sec
+    return () => {
+      clearInterval(poll);
+      clearInterval(clean);
+    };
   }, []);
 
   return (
@@ -38,7 +52,8 @@ export default function Alerts() {
               {a.request.side}
             </div>
             <div className="text-sm">
-              Lots: {a.request.lots || "-"} | Qty: {a.response.preview?.qty || "-"}
+              Lots: {a.request.lots || "-"} | Qty:{" "}
+              {a.response.preview?.qty || "-"}
             </div>
             <div className="text-sm">
               Status: {a.response.status} | Message:{" "}

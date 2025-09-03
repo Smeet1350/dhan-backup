@@ -10,6 +10,7 @@ from scheduler import ensure_fresh_db
 from config import SQLITE_PATH
 
 LOG = logging.getLogger("webhook")
+ALERTS_LOGGER = logging.getLogger("alerts")
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 
 # Global alerts log - newest first
@@ -173,9 +174,14 @@ async def webhook_trade(req: Request):
             "instrument": inst,
             "response": result,
         }
+
+        # Store in in-memory list for dashboard
         ALERTS_LOG.insert(0, alert_entry)
         if len(ALERTS_LOG) > MAX_ALERTS:
             ALERTS_LOG.pop()
+
+        # Log persistently for terminal/log files
+        ALERTS_LOGGER.info("ALERT | %s", alert_entry)
 
         return result
 
