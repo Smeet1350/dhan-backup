@@ -1,88 +1,66 @@
+// src/Alerts.jsx
 import React, { useEffect, useState } from "react";
+import axios from "axios";
+
+const BASE_URL = import.meta.env?.VITE_API_URL || `http://${window.location.hostname}:8000`;
+const api = axios.create({ baseURL: BASE_URL, timeout: 30000 });
 
 export default function Alerts() {
   const [alerts, setAlerts] = useState([]);
-  const [logs, setLogs] = useState([]);
+  const [err, setErr] = useState(null);
 
   const fetchAlerts = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/webhook/alerts");
-      const data = await res.json();
-      if (data.status === "success") {
-        const now = Date.now();
-        const updated = data.alerts.map(a => ({
-          ...a,
-          _expiry: now + 20000, // 20s lifetime
-        }));
-        // Dashboard ephemeral
-        setAlerts(prev => {
-          const merged = [...updated];
-          return merged;
-        });
-        // Log persistent
-        setLogs(prev => [...updated, ...prev].slice(0, 200));
-      }
+      const r = await api.get("/webhook/alerts"); // correct path
+      setAlerts(r.data?.alerts ?? []);
+      setErr(null);
     } catch (e) {
-      console.error("Failed to fetch alerts", e);
+      console.error("fetchAlerts failed", e);
+      setErr("Could not load alerts");
     }
   };
 
   useEffect(() => {
     fetchAlerts();
-    const poll = setInterval(fetchAlerts, 5000);
-    const clean = setInterval(() => {
-      setAlerts(prev => prev.filter(a => Date.now() < a._expiry));
-    }, 1000);
-    return () => {
-      clearInterval(poll);
-      clearInterval(clean);
-    };
+    const id = setInterval(fetchAlerts, 10000);
+    return () => clearInterval(id);
   }, []);
 
   return (
-    <div className="p-4 space-y-6">
-      <div>
-        <h2 className="text-xl font-bold mb-4">⚡ Live Alerts (20s)</h2>
-        <div className="space-y-3">
-          {alerts.map(a => (
-            <div
-              key={a.id}
-              className={`p-4 rounded-xl shadow ${
-                a.response.status === "success" ? "bg-green-800" : "bg-red-800"
-              }`}
-            >
-              <div className="text-sm text-gray-300">
-                Time: {a.timestamp}
-              </div>
-              <div className="font-semibold">
-                {a.request.index} {a.request.strike} {a.request.option_type}{" "}
-                {a.request.side}
-              </div>
-              <div className="text-sm">
-                Lots: {a.request.lots || "-"} | Qty:{" "}
-                {a.response.preview?.qty || "-"}
-              </div>
-              <div className="text-sm">
-                Status: {a.response.status} | Message:{" "}
-                {a.response.message || "N/A"}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+    <section className="card">
+      <h2 className="font-semibold text-lg text-red-300">🚨 Webhook Alerts</h2>
+      {err && <div className="text-sm text-yellow-300">{err}</div>}
+      <div className="mt-2 text-sm max-h-48 overflow-auto">
+        {alerts.length === 0 ? (
+          <div className="text-gray-400">No alerts</div>
+        ) : (
+          <ul className="space-y-2">
+            {alerts.map((a) => (
+              <li key={a.id} className="bg-gray-800 p-2 rounded">
+                <div className="text-xs text-gray-400">
+                  {new Date(a.timestamp).toLocaleString()}
+                </div>
 
-      <div>
-        <h2 className="text-xl font-bold mb-4">📜 Logs (Persistent for Today)</h2>
-        <div className="bg-gray-900 p-3 rounded-lg h-64 overflow-y-auto text-xs font-mono">
-          {logs.map((a, i) => (
-            <div key={i} className="mb-2">
-              [{a.timestamp}] {a.request.index} {a.request.strike}
-              {a.request.option_type} {a.request.side} →{" "}
-              {a.response.status.toUpperCase()} | {a.response.message}
-            </div>
-          ))}
-        </div>
+                {a.trade && (
+                  <div className="text-sm mt-1">
+                    <strong>{a.trade.index}</strong> {a.trade.strike}{a.trade.option_type}
+                    — {a.trade.side}
+                    {a.lots ? ` ${a.lots} lot(s)` : ""}
+                    {a.lot_size ? ` (lotSize=${a.lot_size})` : ""}
+                    → Qty: {a.qty}
+                    @ {a.trade.order_type}
+                    {a.trade.price && a.trade.price > 0 ? ` (₹${a.trade.price})` : ""}
+                  </div>
+                )}
+
+                <div className="text-xs mt-1 text-green-300">
+                  {a.response?.message ?? JSON.stringify(a.response?.broker?.raw ?? {})}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
-    </div>
+    </section>
   );
 }

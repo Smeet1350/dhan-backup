@@ -281,10 +281,32 @@ export default function App() {
                 </thead>
                 <tbody>
                   {holdings.map((h, i) => {
-                    const avg = parseFloat(h.avgCostPrice ?? h.averagePrice ?? 0);
-                    const ltp = parseFloat(h.lastTradedPrice ?? h.ltp ?? 0);
-                    const qtyv = parseFloat(h.totalQty ?? h.quantity ?? 0);
-                    const pnl = (ltp - avg) * qtyv;
+                    // robust avg candidates
+                    const avgCandidates = [
+                      h.avgCostPrice, h.averagePrice, h.avg_price, h.avg, h.averageCost, h.avgCost
+                    ];
+                    const avgRaw = avgCandidates.find(x => x !== undefined && x !== null);
+                    const avg = parseFloat(avgRaw ?? 0);
+
+                    // robust ltp candidates
+                    const ltp = parseFloat(h.lastTradedPrice ?? h.ltp ?? h.last_price ?? h.lastPrice ?? 0);
+
+                    // qty candidates
+                    const qtyv = parseFloat(h.totalQty ?? h.quantity ?? h.qty ?? 0);
+
+                    // prefer broker-provided pnl fields if available
+                    const pnlProvided = (h.unrealisedPnL ?? h.unrealized_pnl ?? h.pnl ?? h.profitLoss ?? h.unrealised_pnl);
+                    let pnl;
+                    if (pnlProvided !== undefined && pnlProvided !== null && pnlProvided !== "") {
+                      pnl = Number(pnlProvided);
+                    } else if (!isNaN(avg) && avg !== 0) {
+                      pnl = (ltp - avg) * qtyv;
+                    } else {
+                      // fallback: try compute from any total cost fields or else 0
+                      const totalCost = (h.totalCost ?? h.cost ?? null);
+                      pnl = totalCost ? (ltp * qtyv) - Number(totalCost) : 0;
+                    }
+
                     return (
                       <tr key={i} className="border-t border-gray-700">
                         <td className="p-2">{h.tradingSymbol}</td>
@@ -297,7 +319,8 @@ export default function App() {
                             source: "holding",
                             symbol: h.tradingSymbol,
                             segment: h.segment || "NSE_EQ",
-                            securityId: h.securityId,
+                            // robust securityId pick
+                            securityId: h.securityId ?? h.security_id ?? h.instrumentId ?? h.instrument_id ?? null,
                             qty: qtyv,
                             side: "SELL", // always sell holdings
                           })}>
@@ -331,10 +354,32 @@ export default function App() {
                 </thead>
                 <tbody>
                   {positions.map((p, i) => {
-                    const avg = parseFloat(p.buyAvg ?? p.avgPrice ?? 0);
-                    const ltp = parseFloat(p.ltp ?? p.lastTradedPrice ?? 0);
-                    const qtyv = parseFloat(p.netQty ?? p.quantity ?? 0);
-                    const pnl = (ltp - avg) * qtyv;
+                    // avg fallbacks
+                    const avgCandidates = [
+                      p.buyAvg, p.avgPrice, p.avg, p.averagePrice, p.avg_price, p.avgCostPrice
+                    ];
+                    const avgRaw = avgCandidates.find(x => x !== undefined && x !== null);
+                    const avg = parseFloat(avgRaw ?? 0);
+
+                    // ltp fallbacks
+                    const ltp = parseFloat(p.ltp ?? p.lastTradedPrice ?? p.last_price ?? p.lastPrice ?? 0);
+
+                    // qty (may be signed)
+                    const qtyv = parseFloat(p.netQty ?? p.quantity ?? p.qty ?? p.netQuantity ?? 0);
+
+                    // prefer broker-provided unrealized pnl field(s)
+                    const pnlProvided = (p.unrealisedPnL ?? p.unrealized_pnl ?? p.pnl ?? p.profitLoss ?? p.unrealised_pnl);
+                    let pnl;
+                    if (pnlProvided !== undefined && pnlProvided !== null && pnlProvided !== "") {
+                      pnl = Number(pnlProvided);
+                    } else if (!isNaN(avg) && avg !== 0) {
+                      pnl = (ltp - avg) * qtyv;
+                    } else {
+                      // fallback - try compute from value vs cost if fields exist, else 0
+                      const totalCost = (p.totalCost ?? p.cost ?? p.notional ?? null);
+                      pnl = totalCost ? (ltp * qtyv) - Number(totalCost) : 0;
+                    }
+
                     return (
                       <tr key={i} className="border-t border-gray-700">
                         <td className="p-2">{p.tradingSymbol}</td>
@@ -347,7 +392,7 @@ export default function App() {
                             source: "position",
                             symbol: p.tradingSymbol,
                             segment: p.segment || "NSE_EQ",
-                            securityId: p.securityId,
+                            securityId: p.securityId ?? p.security_id ?? p.instrumentId ?? p.instrument_id ?? null,
                             qty: Math.abs(qtyv),
                             side: qtyv > 0 ? "SELL" : "BUY", // opposite to close
                           })}>
@@ -599,28 +644,40 @@ export default function App() {
               <button className="btn-danger"
                 onClick={async ()=>{
                   try {
+                    const secId = exitModal.securityId ?? exitModal.security_id ?? null;
                     const params = {
                       symbol: exitModal.symbol,
                       segment: exitModal.segment,
                       side: exitModal.side,
-                      qty: exitModal.qty,
+                      qty: Number(exitModal.qty),
                       order_type: exitModal.orderType || "MARKET",
                       price: Number(exitModal.price) || 0,
                       product_type: exitModal.productType || "INTRADAY",
                       validity: exitModal.validity || "DAY",
-                      security_id: exitModal.securityId,
+                      security_id: secId,
                     };
-                    const res = await api.post("/order/place", null, { params });
-                    if (res.data.status === "success") {
-                      toast("✅ Square off order placed!");
-                      fetchAll();
-                      fetchOrders();
+
+                    // sanity check: require either symbol+segment or security_id
+                    if (!params.security_id && !(params.symbol && params.segment)) {
+                      toast("❌ Exit failed: missing security_id and/or symbol info");
                       setExitModal(null);
+                      return;
+                    }
+
+                    const res = await api.post("/order/place", null, { params });
+                    if (res.data?.status === "success") {
+                      toast("✅ Square off order placed!");
+                      await fetchAll();
+                      await fetchOrders();
+                      setExitModal(null);   // Close modal on success
                     } else {
-                      toast("❌ " + safeMsg(res.data.message));
+                      // show server-provided message when available
+                      toast("❌ " + (res.data?.message || JSON.stringify(res.data) || "Exit failed"));
+                      setExitModal(null);   // still close modal (keeps UI consistent)
                     }
                   } catch (err) {
-                    toast("💥 Error: " + safeMsg(err.message || err));
+                    toast("💥 Error placing exit: " + safeMsg(err.message || err));
+                    setExitModal(null);     // Close modal on error too
                   }
                 }}>
                 Confirm Exit

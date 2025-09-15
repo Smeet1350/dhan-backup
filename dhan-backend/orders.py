@@ -30,9 +30,11 @@ EX_SEG_MAP = {
 SIDE_MAP = {"BUY": "BUY", "SELL": "SELL"}
 ORDTYPE_MAP = {"MARKET": "MARKET", "LIMIT": "LIMIT"}
 PRODUCT_MAP = {
-    "DELIVERY": "CNC",     # SDK expects CNC for delivery
+    "DELIVERY": "CNC",     # Delivery -> CNC in SDK
     "CNC": "CNC",
-    "INTRADAY": "INTRADAY",  # SDK 2.0.2 expects INTRADAY, not INTRA
+    # map both INTRADAY and INTRA inputs to the SDK constant 'INTRA' used in examples
+    "INTRADAY": "INTRA",
+    "INTRA": "INTRA",
 }
 VALIDITY_MAP = {"DAY": "DAY", "IOC": "IOC"}
 
@@ -63,56 +65,82 @@ def broker_ready() -> Tuple[bool, str]:
 def normalize_response(res, success_msg="Success", error_msg="Error"):
     """
     Normalize Dhan SDK response into consistent shape.
-    Always returns: {status, message, broker, data}
+    Returns: {status, message, broker, data}
+    Maps common broker errors to friendly messages (insufficient margin, closed market, restricted).
     """
     try:
         # Exceptions
         if isinstance(res, Exception):
             import traceback
+            raw = str(res) or repr(res)
+            lower = raw.lower()
+            if "insufficient" in lower or "margin" in lower:
+                msg = "Insufficient funds / margin"
+            elif "restricted" in lower or "not allowed" in lower or "trade restricted" in lower:
+                msg = "Trading restricted for this instrument or product"
+            elif "closed" in lower or "market is closed" in lower:
+                msg = "Market is Closed"
+            else:
+                msg = raw
             return {
                 "status": "error",
-                "message": str(res) or error_msg,
-                "broker": {
-                    "raw": str(res),
-                    "trace": traceback.format_exc()
-                },
-                "data": None
+                "message": msg,
+                "broker": {"raw": raw, "trace": traceback.format_exc()},
+                "data": None,
             }
 
-        # Strings
+        # Strings -> try json
         if isinstance(res, str):
             try:
                 res = json.loads(res)
             except Exception:
-                return {"status": "error", "message": res,
-                        "broker": {"raw": res}, "data": None}
+                lower = res.lower()
+                if "insufficient" in lower or "margin" in lower:
+                    return {"status": "error", "message": "Insufficient funds / margin", "broker": {"raw": res}, "data": None}
+                if "restricted" in lower or "not allowed" in lower:
+                    return {"status": "error", "message": "Trading restricted for this instrument or product", "broker": {"raw": res}, "data": None}
+                if "closed" in lower or "market is closed" in lower:
+                    return {"status": "error", "message": "Market is Closed", "broker": {"raw": res}, "data": None}
+                return {"status": "error", "message": res, "broker": {"raw": res}, "data": None}
 
-        # Lists
+        # Lists -> success
         if isinstance(res, list):
-            return {"status": "success", "message": success_msg,
-                    "broker": {"raw": res}, "data": res}
+            return {"status": "success", "message": success_msg, "broker": {"raw": res}, "data": res}
 
         # Dicts
         if isinstance(res, dict):
             raw = res.copy()
+            # success detection
             if str(raw.get("status", "")).lower() == "success" \
                or "orderId" in raw \
                or ("data" in raw and isinstance(raw["data"], dict) and "orderId" in raw["data"]):
-                return {"status": "success",
-                        "message": raw.get("message") or success_msg,
-                        "broker": raw, "data": raw.get("data", raw)}
-            msg = (raw.get("remarks", {}).get("error_message")
-                   or raw.get("data", {}).get("errorMessage")
-                   or raw.get("message")
-                   or error_msg)
-            return {"status": "error", "message": str(msg),
-                    "broker": raw, "data": raw.get("data")}
+                return {"status": "success", "message": raw.get("message") or success_msg, "broker": raw, "data": raw.get("data", raw)}
 
-        return {"status": "error", "message": str(res),
-                "broker": {"raw": str(res)}, "data": None}
+            # pick candidate message fields
+            candidates = []
+            if isinstance(raw.get("remarks"), dict):
+                candidates.append(raw["remarks"].get("error_message"))
+            if isinstance(raw.get("data"), dict):
+                candidates.append(raw["data"].get("errorMessage"))
+                candidates.append(raw["data"].get("error_message"))
+                candidates.append(raw["data"].get("message"))
+            candidates.append(raw.get("message"))
+            candidates.append(raw.get("error"))
+            msg = next((str(c) for c in candidates if c), None) or error_msg
+
+            low = str(msg).lower()
+            if "insufficient" in low or ("margin" in low and "insufficient" in low) or "insufficent" in low:
+                msg = "Insufficient funds / margin"
+            elif "restricted" in low or ("not allowed" in low and "trade" in low) or "trade restricted" in low:
+                msg = "Trading restricted for this instrument or product"
+            elif "closed" in low or "market is closed" in low:
+                msg = "Market is Closed"
+            return {"status": "error", "message": str(msg), "broker": raw, "data": raw.get("data")}
+
+        # fallback
+        return {"status": "error", "message": str(res), "broker": {"raw": str(res)}, "data": None}
     except Exception as e:
-        return {"status": "error", "message": f"Normalization failed: {e}",
-                "broker": {"raw": str(res)}, "data": None}
+        return {"status": "error", "message": f"Normalization failed: {e}", "broker": {"raw": str(res)}, "data": None}
 
 
 # --- Order placement ---
@@ -134,20 +162,54 @@ def place_order_via_broker(
         return RuntimeError(f"Broker not ready: {why}")
 
     try:
-        ex_const = getattr(_dhan, EX_SEG_MAP[segment])
+        # helper to fetch SDK constant if present, otherwise fall back to raw string
+        def _sdk_const(name: str):
+            try:
+                return getattr(_dhan, name)
+            except Exception:
+                return name
+
+        ex_const = _sdk_const(EX_SEG_MAP.get(segment, segment))
+        tx_const = _sdk_const(SIDE_MAP.get(side, side))
+        ordtype_const = _sdk_const(ORDTYPE_MAP.get(order_type, order_type))
+        prod_const = _sdk_const(PRODUCT_MAP.get(product_type, product_type))
+        valid_const = _sdk_const(VALIDITY_MAP.get(validity, validity))
+
+        # price must always be numeric for the SDK; use 0.0 for market orders
+        price_val = 0.0 if (order_type == "MARKET" or price is None) else float(price)
+
         payload = {
             "security_id": str(security_id),
             "exchange_segment": ex_const,
-            "transaction_type": SIDE_MAP[side],
+            "transaction_type": tx_const,
             "quantity": int(qty),
-            "order_type": ORDTYPE_MAP[order_type],
-            "product_type": PRODUCT_MAP[product_type],
-            "validity": VALIDITY_MAP[validity],
-            "price": 0.0 if order_type == "MARKET" else float(price),
+            "order_type": ordtype_const,
+            "product_type": prod_const,
+            "validity": valid_const,
+            "price": float(price_val),
             "disclosed_quantity": int(disclosed_qty or 0),
         }
         logger.info("Placing order: payload=%s", payload)
-        return _dhan.place_order(**payload)   # return raw, no normalization
+        try:
+            return _dhan.place_order(**payload)
+        except TypeError as te:
+            # Fallback: some SDK versions expect positional args — try a positional call
+            logger.warning("place_order keyword call failed, trying positional fallback: %s", te)
+            try:
+                return _dhan.place_order(
+                    payload["security_id"],
+                    payload["exchange_segment"],
+                    payload["transaction_type"],
+                    payload["quantity"],
+                    payload["order_type"],
+                    payload["price"],
+                    payload["product_type"],
+                    payload["validity"],
+                    payload["disclosed_quantity"],
+                )
+            except Exception:
+                logger.exception("Fallback positional place_order also failed")
+                raise
     except Exception as e:
         logger.exception("place_order_via_broker failed")
         return e

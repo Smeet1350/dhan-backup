@@ -176,8 +176,7 @@ def db_is_current(db_path: Optional[str] = None) -> bool:
 def symbol_search(db_path: Optional[str], query: str, segment: str, limit: int = 30) -> List[Dict[str, str | int]]:
     if not query or not os.path.exists(db_path):
         return []
-    conn = sqlite3.connect(db_path)
-    try:
+    with sqlite3.connect(db_path) as conn:
         sql = """
           SELECT securityId, tradingSymbol, segment, lotSize, expiry
           FROM instruments
@@ -192,14 +191,11 @@ def symbol_search(db_path: Optional[str], query: str, segment: str, limit: int =
         rows = conn.execute(sql, (f"%{query.strip()}%", (segment or "").strip(), int(limit))).fetchall()
         cols = ["securityId", "tradingSymbol", "segment", "lotSize", "expiry"]
         return [dict(zip(cols, r)) for r in rows]
-    finally:
-        conn.close()
 
 def resolve_symbol(db_path: Optional[str], symbol: str, segment: str) -> Optional[Dict[str, str | int]]:
     if not symbol or not os.path.exists(db_path):
         return None
-    conn = sqlite3.connect(db_path)
-    try:
+    with sqlite3.connect(db_path) as conn:
         sql = """
           SELECT securityId, tradingSymbol, segment, lotSize, expiry
           FROM instruments
@@ -212,8 +208,6 @@ def resolve_symbol(db_path: Optional[str], symbol: str, segment: str) -> Optiona
             return None
         cols = ["securityId", "tradingSymbol", "segment", "lotSize", "expiry"]
         return dict(zip(cols, row))
-    finally:
-        conn.close()
 
 # ------------- Scheduler -------------
 _sched: Optional[BackgroundScheduler] = None
@@ -239,6 +233,12 @@ def ensure_fresh_db(db_path: str) -> bool:
 
 def start_scheduler(db_path: Optional[str] = None) -> BackgroundScheduler:
     global _sched
+    
+    # Optional: gate with environment variable
+    if os.getenv("RUN_SCHEDULER", "true").lower() not in ("true", "1", "yes"):
+        LOG.info("Scheduler disabled by RUN_SCHEDULER env var")
+        return None
+    
     if _sched:
         return _sched
 
@@ -246,9 +246,30 @@ def start_scheduler(db_path: Optional[str] = None) -> BackgroundScheduler:
     LOG.info("⏳ Starting scheduler (IST): 08:00 download, 15:45 cleanup | db=%s", db_path)
 
     _sched = BackgroundScheduler(timezone="Asia/Kolkata")
-    _sched.add_job(lambda: download_and_populate(db_path), "cron", hour=8, minute=0, id="download_job")
-    _sched.add_job(lambda: cleanup_instruments(db_path), "cron", hour=15, minute=45, id="cleanup_job")
-    _sched.start()
+    _sched.add_job(
+        lambda: download_and_populate(db_path), 
+        "cron", 
+        hour=8, 
+        minute=0, 
+        id="download_job", 
+        replace_existing=True,
+        misfire_grace_time=300,  # 5 minutes
+        max_instances=1
+    )
+    _sched.add_job(
+        lambda: cleanup_instruments(db_path), 
+        "cron", 
+        hour=15, 
+        minute=45, 
+        id="cleanup_job", 
+        replace_existing=True,
+        misfire_grace_time=300,  # 5 minutes
+        max_instances=1
+    )
+    try:
+        _sched.start()
+        LOG.info("✅ Scheduler started")
+    except Exception:
+        LOG.exception("Failed to start APScheduler (maybe already running in this process)")
 
-    LOG.info("✅ Scheduler started")
     return _sched

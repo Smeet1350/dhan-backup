@@ -54,8 +54,7 @@ def round_strike(strike: int, index_symbol: str) -> int:
 
 def find_instrument(db_path: str, index_symbol: str, strike: int, option_type: str) -> dict:
     """Find instrument based on actual DB format."""
-    conn = sqlite3.connect(db_path)
-    try:
+    with sqlite3.connect(db_path) as conn:
         sql = """
             SELECT securityId, tradingSymbol, segment, lotSize, expiry
             FROM instruments
@@ -84,9 +83,6 @@ def find_instrument(db_path: str, index_symbol: str, strike: int, option_type: s
 
         valid.sort(key=lambda x: x[0])
         return valid[0][1]
-
-    finally:
-        conn.close()
 
 
 @router.post("/trade")
@@ -169,12 +165,16 @@ async def webhook_trade(req: Request):
         result = normalize_response(raw_res, success_msg="Order placed via webhook", error_msg="Webhook order failed")
 
         # Attach request info to alerts log
+        from copy import deepcopy
         alert_entry = {
             "id": str(uuid.uuid4()),
             "timestamp": datetime.now().isoformat(),
-            "request": body,
-            "instrument": inst,
-            "response": result,
+            "trade": deepcopy(body),     # full original trade payload
+            "instrument": inst,          # resolved instrument details
+            "qty": qty,                  # final computed quantity
+            "lots": lots,                # explicit lots entered
+            "lot_size": lot_size,        # lot size used for calculation
+            "response": result,          # broker response (success/failure + orderId etc.)
         }
 
         # Store in in-memory list for dashboard
